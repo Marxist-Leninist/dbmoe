@@ -18,7 +18,7 @@ python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 curl -fsSL https://codex.opentransformers.online/dbmoe/code -o dbmoe.py
 python3 dbmoe.py worker
 
-# Options: --device cuda|rocm|mps  --threads 4  --hours 1  --no-serve
+# Options: --device cuda|rocm|xpu|mps  --threads 4  --hours 1  --no-serve
 
 # Leaving for good: takes you off the worker list
 curl -fsSL https://codex.opentransformers.online/dbmoe/leave.sh | sh</code></pre><p class="small">Use only computers you own or are authorized to use. Source and setup guide: <a href="https://github.com/Marxist-Leninist/dbmoe" rel="noopener noreferrer">GitHub repository</a>.</p><details style="margin-top:18px"><summary>Use one identity across several machines</summary><p class="small">After installing the worker, create one contributor token. Copy its file securely to the other computers you own or are authorised to use. Start each machine with a different worker name; their contributions share the same identity.</p><pre><code># Create the shared identity once

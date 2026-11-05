@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.token
+token.*
+tokens.json
+.env*
+run/
+*.pt
+*.safetensors
+*.log
+*.jsonl

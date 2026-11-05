@@ -570,7 +570,7 @@ Intel GPUs need an XPU build of PyTorch: https://github.com/Marxist-Leninist/dbm
 The worker gets its own credential by itself, trains one block at a time and serves that block for network inference
 (--no-serve turns serving off).  Every update is tested on held-out text before it is merged.  Ctrl+C stops it.
 Leaving for good: curl -fsSL {base}/leave.sh | sh     (or python3 dbmoe.py leave; takes you off the public list and ends your credential)
-Live status: {base}/status     Sample text: {base}/sample?prompt=The%20&n=120     Network sample: {base}/sample?net=1&prompt=The%20&n=32
+Live status: {base}/status     Sample text: {base}/sample?prompt=The%20&n=120     Network sample: {base}/sample?net=1&route=auto&prompt=The%20&n=32
 """
 
 LEAVE_SH = r"""#!/bin/sh
@@ -861,24 +861,42 @@ class NetInfer:
         self.max_peers, self.online_s = max_peers, online_s
         self.cv = threading.Condition(threading.RLock())
         self.snaps, self.current = collections.OrderedDict(), None
+        self.active_snaps = collections.Counter()
+        self.snapshot_lock = threading.Lock()
+        self.snapshot_epoch = secrets.randbits(51) + (1 << 51)  # JSON-safe, fresh process identity
         self.peers, self.idle, self.pending, self.fetching, self.last_fetch = {}, {}, {}, {}, {}
         self.gen_lock = threading.Lock()
         self.stats = dict(generations=0, bytes=0, seconds=0.0, hops_network=0, hops_coordinator=0, retries=0, audits=0, audit_failures=0)
         self.recent = collections.deque(maxlen=64)
+        self.auto_choices = {}                 # (snapshot, sampler) -> measured paired route choice
         self.snapshot()
         threading.Thread(target=self._housekeeping, daemon=True).start()
 
     # --- snapshots
     def snapshot(self):
-        m = self.C.copy_model()
+        with self.snapshot_lock:
+            return self._snapshot()
+
+    def _snapshot(self):
         with self.C.lock:
+            m = self.C.copy_model()
             updates = self.C.meta['updates']
+        digest = hashlib.sha256(json.dumps(dict(cfg=m.cfg, sigmas=m.sigmas), sort_keys=True).encode())
+        for name, value in sorted(m.state_dict().items()):
+            digest.update(name.encode())
+            digest.update(str((tuple(value.shape), str(value.dtype))).encode())
+            digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+        state_hash = digest.hexdigest()
         with self.cv:
-            sid = max(int(time.time()), (self.current or 0) + 1)
-            self.snaps[sid] = dict(id=sid, model=m, updates=updates, t=time.time(), blobs={})
+            sid = (self.current if self.current is not None else self.snapshot_epoch) + 1
+            self.snaps[sid] = dict(id=sid, model=m, updates=updates, state_hash=state_hash, t=time.time(), blobs={})
             self.current = sid
-            while len(self.snaps) > 2:
-                self.snaps.popitem(last=False)
+            keep = set(list(self.snaps)[-2:]) | set(self.active_snaps)
+            for old in list(self.snaps):
+                if old not in keep:
+                    del self.snaps[old]
+                    for key in [key for key in self.auto_choices if key[0] == old]:
+                        del self.auto_choices[key]
             for slot in self.idle.values():             # wake parked workers so they can pick up the new weights
                 slot.event.set()
         return sid
@@ -902,7 +920,7 @@ class NetInfer:
     def block_blob(self, snap, block, owner):
         with self.cv:
             s = self.snaps.get(snap)
-            if not s or not 0 <= block < self.C.model.cfg['blocks']:
+            if not s or not 0 <= block < s['model'].cfg['blocks']:
                 return None, 'unknown snapshot or block'
             if self.C.is_open(owner):
                 t = time.time()
@@ -962,9 +980,10 @@ class NetInfer:
             fetching = self.fetching.get(block)
             if fetching and fetching[0] == key and snap == self.current:
                 del self.fetching[block]
-            target = self._target(key, p, now)
             live = block is not None and snap in self.snaps
-            if not live or block != target or snap != self.current:
+            keep_pinned = live and self.active_snaps.get(snap, 0) > 0
+            target = block if keep_pinned else self._target(key, p, now)
+            if not keep_pinned and (not live or block != target or snap != self.current):
                 if self._may_fetch(key, target, now, urgent=not live or block != target):
                     return dict(assign=dict(snap=self.current, block=target))
                 if not live:
@@ -993,12 +1012,15 @@ class NetInfer:
         return removed
 
     # --- generation side of the router
-    def coverage(self):
+    def coverage(self, snapshot_id=None):
         now = time.time()
-        cov = [0] * self.C.model.cfg['blocks']
         with self.cv:
+            model = self.C.model if snapshot_id is None else self.snaps[snapshot_id]['model']
+            cov = [0] * model.cfg['blocks']
             for q in self.peers.values():
-                if now - q['seen'] < self.online_s and not q['banned'] and q.get('block') is not None and q.get('snap') in self.snaps:
+                if (now - q['seen'] < self.online_s and not q['banned'] and q.get('block') is not None
+                        and 0 <= q['block'] < len(cov) and q.get('snap') in self.snaps
+                        and (snapshot_id is None or q.get('snap') == snapshot_id)):
                     cov[q['block']] += 1
         return cov
 
@@ -1011,7 +1033,7 @@ class NetInfer:
                 now = time.time()
                 for key, slot in list(self.idle.items()):
                     p = self.peers.get(key)
-                    if slot.block != job['block'] or key in tried or not p or p['banned'] or p.get('snap') not in self.snaps:
+                    if slot.block != job['block'] or key in tried or not p or p['banned'] or p.get('snap') not in self.snaps or p.get('snap') != job.get('snap'):
                         continue
                     if not sock_alive(slot.conn):
                         del self.idle[key]
@@ -1028,15 +1050,15 @@ class NetInfer:
                     best.job = j
                     best.event.set()
                     return P, bestp
-                someone = any(k not in tried and not q['banned'] and q.get('block') == job['block'] and q.get('snap') in self.snaps
+                someone = any(k not in tried and not q['banned'] and q.get('block') == job['block'] and q.get('snap') == job.get('snap') and q.get('snap') in self.snaps
                               and now - q['seen'] < self.online_s for k, q in self.peers.items())
                 left = deadline - now
                 if not someone or left <= 0:
                     return None, None
                 self.cv.wait(left)
 
-    def _decode(self, res, final):
-        cfg = self.C.model.cfg
+    def _decode(self, res, final, cfg=None):
+        cfg = self.C.model.cfg if cfg is None else cfg
         if res.get('error'):
             raise ValueError(str(res['error'])[:200])
         zl = decode_floats(res['z'], cfg['d']).view(1, 1, -1)
@@ -1054,15 +1076,17 @@ class NetInfer:
                            decode_floats(job['z'], model.cfg['d']).view(1, 1, -1), job['grid'], job['final'],
                            job.get('exit_conf', 0.0) if exit_conf is None else exit_conf)
 
-    def _matches(self, j, zl, lg):
+    def _matches(self, j, zl, lg, model=None):
         """Does this result agree with the snapshot it claims to come from?  Returns (agrees or None, z, logits) recomputed here."""
-        with self.cv:
-            s = self.snaps.get(j['snap'])
-        if not s:
-            return None, None, None
-        zc, lc = self._local(j, s['model'])
+        if model is None:
+            with self.cv:
+                s = self.snaps.get(j['snap'])
+            if not s:
+                return None, None, None
+            model = s['model']
+        zc, lc = self._local(j, model)
         if (lg is None) != (lc is None):                # right at the exit threshold, rounding may decide differently: look again either side of it
-            zc, lc = self._local(j, s['model'], j.get('exit_conf', 0.0) + (-0.01 if lg is not None else 0.01))
+            zc, lc = self._local(j, model, j.get('exit_conf', 0.0) + (-0.01 if lg is not None else 0.01))
         ok = (lg is None) == (lc is None) and float((zl - zc).abs().max()) <= 0.02 * max(1.0, float(zc.abs().max()))
         if ok and lc is not None:
             ok = float((lg - lc).abs().max()) <= 0.02 * max(1.0, float(lc.abs().max()))
@@ -1081,9 +1105,9 @@ class NetInfer:
             self.C.enrol.strike(p['owner'], 2)
         self.C.log(ev='hop_mismatch', worker=p['worker'], strikes=p['strikes'], banned=p['banned'])
 
-    def _audit_later(self, key, p, j, zl, lg):
+    def _audit_later(self, key, p, j, zl, lg, model):
         try:
-            ok, _, _ = self._matches(j, zl, lg)
+            ok, _, _ = self._matches(j, zl, lg, model=model)
             with self.cv:
                 self.stats['audits'] += ok is not None
             if ok is False:
@@ -1094,7 +1118,7 @@ class NetInfer:
     def hop(self, job):
         """One block's part of one byte, on a worker if at all possible.  Returns z, logits-or-None, and what ran it."""
         tried = set()
-        for _ in range(self.retries + 1):
+        for _ in range(0 if job.get('route') == 'single' else self.retries + 1):
             P, p = self._claim(job, tried)
             if P is None:
                 break
@@ -1107,7 +1131,7 @@ class NetInfer:
             zl = lg = None
             if got:
                 try:
-                    zl, lg = self._decode(P['result'], job['final'])
+                    zl, lg = self._decode(P['result'], job['final'], self.snaps[job['snap']]['model'].cfg)
                 except Exception as e:
                     print(f'[net] bad hop result: {e!r}', flush=True)
             if zl is None:
@@ -1126,34 +1150,97 @@ class NetInfer:
                     self.stats['audits'] += ok is not None
                 if ok is False:
                     self._strike(key, p)
+                    if job.get('route') == 'distributed':
+                        raise RuntimeError('distributed verification failed; no single-host substitution')
                     with self.cv:
                         self.stats['hops_coordinator'] += 1
                     return zc, lc, dict(block=job['block'], via='coordinator', ms=round(ms))
             elif random.random() < (self.audit_open if p['open'] else self.audit_trusted):
-                threading.Thread(target=self._audit_later, args=(key, p, j, zl, lg), daemon=True).start()
+                threading.Thread(target=self._audit_later, args=(key, p, j, zl, lg, self.snaps[j['snap']]['model']), daemon=True).start()
             with self.cv:
                 self.stats['hops_network'] += 1
             return zl, lg, dict(block=job['block'], via=self.C.alias(p['worker']), ms=round(ms))
+        if job.get('route') == 'distributed':
+            raise RuntimeError('distributed route unavailable; no single-host substitution')
         t0 = time.time()
         with self.cv:
-            model = self.snaps[self.current]['model']
+            model = self.snaps[job['snap']]['model']
         zl, lg = self._local(job, model)
         with self.cv:
             self.stats['hops_coordinator'] += 1
         return zl, lg, dict(block=job['block'], via='coordinator', ms=round((time.time() - t0) * 1000))
 
-    def generate(self, prompt, n, temp=0.0, top_k=40, seed=0, sampler='chain'):
-        """Yield JSON-ready events as the bytes are produced."""
-        cfg, sig = self.C.model.cfg, self.C.model.sigmas
-        B, spb = cfg['blocks'], self.spb
+    def _auto_choice(self, snapshot_id, sampler, temp, top_k, seed):
+        """Measure one byte on each real route, then cache the faster route for this snapshot/sampler.
+
+        The probes use fixed public text and their own pinned generations. They never consume the caller's
+        prompt or alter its random stream. A failed distributed probe selects a working single route; there is
+        no hidden fallback during the actual generation.
+        """
+        key = (snapshot_id, sampler)
+        with self.cv:
+            cached = self.auto_choices.get(key)
+        if cached:
+            return dict(cached, cached=True)
+        measured = {}
+        for route in ('single', 'distributed'):
+            started = time.monotonic()
+            try:
+                events = list(self.generate('The ', 1, temp=temp, top_k=top_k, seed=seed, sampler=sampler,
+                                            route=route, snapshot_id=snapshot_id, _calibration=True))
+                if not events or events[-1].get('t') != 'done' or events[-1].get('bytes') != 1:
+                    raise RuntimeError('calibration did not complete')
+                measured[route] = dict(ok=True, seconds=round(time.monotonic() - started, 4))
+            except Exception as e:
+                measured[route] = dict(ok=False, seconds=round(time.monotonic() - started, 4), error=type(e).__name__)
+        usable = [route for route in ('single', 'distributed') if measured[route]['ok']]
+        if not usable:
+            raise RuntimeError('automatic calibration failed on both routes')
+        route = min(usable, key=lambda name: measured[name]['seconds'])
+        result = dict(route=route, sampler=sampler, snapshot_id=snapshot_id, measured=measured,
+                      cached=False, measured_at=time.time(), probe='one byte per route on the pinned snapshot')
+        with self.cv:
+            self.auto_choices[key] = dict(result)
+        return result
+
+    def generate(self, prompt, n, temp=0.0, top_k=40, seed=0, sampler='chain', route='network', snapshot_id=None, _calibration=False):
+        """Yield JSON-ready events using one pinned snapshot and the requested sampler."""
+        if route not in ('auto', 'single', 'distributed', 'network'):
+            raise ValueError('route must be auto, single, distributed or network')
+        if sampler not in ('chain', 'top'):
+            raise ValueError('sampler must be chain or top')
+        requested_route = route
         gen = torch.Generator().manual_seed(seed)
         ids = encode(prompt) or [10]
         with self.cv:
-            s0 = self.snaps[self.current]
+            sid = self.current if snapshot_id is None else snapshot_id
+            if sid not in self.snaps:
+                raise ValueError('requested snapshot is unavailable')
+        auto_info = None
+        if requested_route == 'auto':
+            auto_info = self._auto_choice(sid, sampler, temp, top_k, seed)
+            route = auto_info['route']
+        with self.cv:
+            if sid not in self.snaps:
+                raise ValueError('requested snapshot is unavailable')
+            s0 = self.snaps[sid]
+            cfg, sig = s0['model'].cfg, s0['model'].sigmas
+            if route == 'distributed':
+                required = {cfg['blocks'] - 1} if sampler == 'top' else set(range(cfg['blocks']))
+                available = {p.get('block') for p in self.peers.values()
+                             if p.get('snap') == sid and not p.get('banned')
+                             and time.time() - p.get('seen', 0) < self.online_s}
+                if not required <= available:
+                    raise RuntimeError('requested distributed snapshot lacks block coverage')
+            self.active_snaps[sid] += 1
+        B, spb = cfg['blocks'], self.spb
+        sampler_config = dict(temp=temp, top_k=top_k, steps_per_block=spb, ctx_len=self.ctx_len, exit_conf=EXIT_CONF)
         t_start, out, used, on_net, on_coord = time.time(), 0, set(), 0, 0
-        yield dict(t='start', n=n, prompt_bytes=len(ids), coverage=self.coverage(), snapshot_updates=s0['updates'],
-                   snapshot_age_s=round(time.time() - s0['t']))
         try:
+            yield dict(t='start', n=n, prompt_bytes=len(ids), coverage=self.coverage(sid), snapshot_id=sid,
+                       state_hash=s0['state_hash'], route=route, requested_route=requested_route, auto_calibration=auto_info,
+                       calibration=_calibration, sampler=sampler, sampler_config=sampler_config, seed=seed,
+                       snapshot_updates=s0['updates'], snapshot_age_s=round(time.time() - s0['t']))
             for k in range(n):
                 t0 = time.time()
                 raw = base64.b64encode(bytes(ids[-self.ctx_len:])).decode()
@@ -1163,7 +1250,7 @@ class NetInfer:
                 for i in ([B - 1] if sampler == 'top' else reversed(range(B))):
                     grid = [sig[-1], sig[-2]] if sampler == 'top' else block_grid(sig, i, spb)
                     zl, lg, info = self.hop(dict(block=i, ids=raw, seed=ek_seed, z=encode_floats(zl), grid=grid,
-                                                 final=sampler == 'top' or i == 0, exit_conf=EXIT_CONF))
+                                                 final=sampler == 'top' or i == 0, exit_conf=EXIT_CONF, snap=sid, route=route))
                     hops.append(info)
                     if info['via'] == 'coordinator':
                         on_coord += 1
@@ -1179,8 +1266,13 @@ class NetInfer:
         finally:
             dt = time.time() - t_start
             summary = dict(bytes=out, seconds=round(dt, 2), bytes_per_s=round(out / max(dt, 1e-6), 3), hops_network=on_net,
-                           hops_coordinator=on_coord, hops_per_byte=round((on_net + on_coord) / max(out, 1), 2), workers=len(used), t=time.time())
+                           hops_coordinator=on_coord, hops_per_byte=round((on_net + on_coord) / max(out, 1), 2), workers=len(used), snapshot_id=sid, state_hash=s0['state_hash'], route=route,
+                           requested_route=requested_route, auto_calibration=auto_info, calibration=_calibration,
+                           sampler=sampler, sampler_config=sampler_config, seed=seed, t=time.time())
             with self.cv:
+                self.active_snaps[sid] -= 1
+                if not self.active_snaps[sid]:
+                    del self.active_snaps[sid]
                 self.stats['generations'] += 1
                 self.stats['bytes'] += out
                 self.stats['seconds'] += dt
@@ -1204,7 +1296,7 @@ class NetInfer:
             last['age_s'] = round(now - last.pop('t'))
         st['seconds'] = round(st['seconds'], 1)
         return dict(online_workers=online, banned_workers=banned, peers=peers, coverage=cov, covered_blocks=sum(c > 0 for c in cov), blocks=len(cov),
-                    ready=all(c > 0 for c in cov), snapshot=dict(updates=s['updates'], age_s=round(now - s['t'])),
+                    ready=all(c > 0 for c in cov), snapshot=dict(id=s['id'], state_hash=s['state_hash'], updates=s['updates'], age_s=round(now - s['t'])),
                     bytes_per_s_last_hour=round(sum(r['bytes'] for r in recent) / secs, 3) if secs else None,
                     network_hop_share=round(st['hops_network'] / hops, 4) if hops else None, last_generation=last, **st)
 
@@ -1866,13 +1958,23 @@ def serve(a):
             sampler = q.get('sampler') or q.get('mode') or 'chain'
             if sampler not in ('chain', 'top'):
                 return self._send(400, dict(error='sampler must be chain or top'))
-            n, temp, seed = max(1, min(160, int(q.get('n', 64)))), float(q.get('temp', 0.0 if sampler == 'chain' else 0.75)), int(q.get('seed', 0)) % (2 ** 31)
+            try:
+                n, temp, seed = max(1, min(160, int(q.get('n', 64)))), float(q.get('temp', 0.0 if sampler == 'chain' else 0.75)), int(q.get('seed', 0)) % (2 ** 31)
+                snapshot_id = int(q['snapshot']) if 'snapshot' in q else None
+            except (ValueError, TypeError, OverflowError):
+                return self._send(400, dict(error='invalid generation parameters or snapshot'))
             if not math.isfinite(temp):
                 return self._send(400, dict(error='temp must be finite'))
+            route = q.get('route', 'network')
+            if route not in ('auto', 'single', 'distributed', 'network'):
+                return self._send(400, dict(error='route must be auto, single, distributed or network'))
             if not C.net.gen_lock.acquire(blocking=False):
                 return self._send(503, dict(error='a generation is already running; try again shortly'))
             g = None
+            headers_started = False
             try:
+                g = C.net.generate(prompt, n, temp=temp, seed=seed, sampler=sampler, route=route, snapshot_id=snapshot_id)
+                first = next(g)  # Validate and pin before HTTP success.
                 self.close_connection = True
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/x-ndjson; charset=utf-8')
@@ -1880,7 +1982,9 @@ def serve(a):
                 self.send_header('X-Accel-Buffering', 'no')
                 self.send_header('Connection', 'close')
                 self.end_headers()
-                g = C.net.generate(prompt, n, temp=temp, seed=seed, sampler=sampler)
+                headers_started = True
+                self.wfile.write((json.dumps(first, separators=(',', ':')) + '\n').encode())
+                self.wfile.flush()
                 for ev in g:
                     self.wfile.write((json.dumps(ev, separators=(',', ':')) + '\n').encode())
                     self.wfile.flush()
@@ -1888,6 +1992,8 @@ def serve(a):
                 pass                                    # the reader went away: stop generating
             except Exception as e:
                 print(f'[net] generation failed: {e!r}', flush=True)
+                if not headers_started:
+                    return self._send(409, dict(error='requested route or snapshot unavailable'))
                 try:
                     self.wfile.write((json.dumps(dict(t='error', error='generation failed')) + '\n').encode())
                 except OSError:

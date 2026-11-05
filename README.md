@@ -76,10 +76,16 @@ The live counts are on the [progress page](https://codex.opentransformers.online
 ## Network inference
 
 ```sh
-curl -N "https://codex.opentransformers.online/dbmoe/sample?net=1&prompt=The%20&n=32"
+# Automatic: measure both real routes on this snapshot and use the faster one
+curl -N "https://codex.opentransformers.online/dbmoe/sample?net=1&route=auto&prompt=The%20&n=32"
+
+# Explicit alternatives: single, distributed (strict), or network (existing fallback behaviour)
+curl -N "https://codex.opentransformers.online/dbmoe/sample?net=1&route=distributed&prompt=The%20&n=32"
 ```
 
-Each byte's diffusion chain goes from worker to worker, one hop per block. Workers long-poll for hops, so this works from behind NAT. The reply is a stream of JSON lines naming the anonymous worker behind every hop. If nobody holds a block, or a worker vanishes, the hop is rerouted or the coordinator runs it and says so. A chain stops early once a block is already certain of the next byte. `sampler=top` uses only the top block, one hop per byte.
+Each response is pinned to one checkpoint snapshot, including across a snapshot rollover. `route=auto` performs one bounded byte of fixed public text on the single coordinator and on strict distributed inference, then caches the faster choice for that snapshot and sampler. It never uses the caller's prompt for calibration, and the selected route and probe timings are reported in the stream. `route=single` uses the coordinator; `route=distributed` requires the necessary workers and forbids coordinator substitution; `route=network` preserves the existing network-with-coordinator-fallback behaviour.
+
+Each byte's diffusion chain goes from worker to worker, one hop per block. Workers long-poll for hops, so this works from behind NAT. The reply is a stream of JSON lines naming the anonymous worker behind every hop. If nobody holds a block, or a worker vanishes, the hop is rerouted or the coordinator runs it and says so unless strict distributed mode was requested. A chain stops early once a block is already certain of the next byte. `sampler=top` uses only the top block, one hop per byte.
 
 ## AMD GPUs (ROCm)
 

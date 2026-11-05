@@ -6,7 +6,7 @@
 - [Browser training self-test](https://codex.opentransformers.online/dbmoe/browser-selftest/)
 - [Native worker joining instructions](https://codex.opentransformers.online/dbmoe/)
 
-The progress dashboard reads the coordinator's public status and displays accepted work, evaluation history, network inference, and available self-reported worker hardware.
+The progress dashboard reads the coordinator's public status and displays accepted work, evaluation history, network inference, and available self-reported worker hardware. Its inference controls offer measured automatic routing, a single coordinator, strict distributed inference without fallback, and the existing network-with-fallback mode. Automatic mode uses one fixed-public-text byte per route on the pinned snapshot, caches the faster result for that snapshot/sampler, and reports the selected route and probe timings.
 
 ## Browser test scope
 

@@ -43,7 +43,7 @@ Active anonymous access renews automatically. There is no daily participant coun
 
 The worker trains and can serve an inference block. This uses your machine's compute, electricity and network; only join on machines you own or are authorized to use. Inference workers can see prompt bytes routed through their block, so do not send private prompts to a public volunteer network. `--no-serve` opts out of serving. Submitted training updates are checked before merging, but those checks do not guarantee language improvement or protection against every malicious update.
 
-**Release synchronization:** the live anonymous worker is currently served at `/dbmoe/code`. The repository's AMD/MPS backend and opt-in hardware extensions are being merged with that newer network protocol. Do not assume an option supported by one revision is available in another; check `python dbmoe.py --help` and `python dbmoe.py worker --help`. The CPU anonymous join flow above has been tested against the live endpoint.
+**Release synchronization:** the live worker at `/dbmoe/code` and this repository now carry the same v4 protocol: anonymous joining, lease/learning gates, bounded downloads, split block/shared-round validation, and measured `chain`/`top` sampling. CPU, NVIDIA CUDA, AMD ROCm and Apple MPS code paths are included. Physical AMD and Apple-hardware validation remains pending; no capability claim is made for those devices yet.
 
 In this repository, `--device cpu` remains the default; `cuda` selects NVIDIA, `rocm` selects a supported AMD GPU, and `mps` selects a compatible Mac GPU. `auto` explicitly opts into CUDA/ROCm first, then MPS, otherwise CPU. Explicit GPU requests fail early when unavailable. These backend extensions still need integration into the deployed anonymous worker.
 
@@ -63,7 +63,7 @@ python dbmoe.py check-device --device rocm
 
 Expect a nonempty HIP version, GPU availability `True`, and a successful `check-device` result. This runs a tiny synthetic DBMoE forward/backward/AdamW update and checks finite, bounded CPU deltas through safe serialization. It makes no network request, reads no token, and changes no training checkpoint. GPU workers also run this check automatically before their first lease. It does not establish full-size-model memory capacity or long-run stability.
 
-The AMD device-check implementation is in this repository, but integration with the deployed anonymous worker is pending. Do not substitute an older token-requiring worker into the anonymous join instructions. Physical AMD training validation is still required before claiming a tested AMD release.
+The AMD device check is integrated into the deployed anonymous worker. Physical AMD training validation is still required before claiming a tested AMD release; the mocked backend suite is not hardware proof.
 
 Use `--device rocm:1` for the second visible GPU, or `--device cuda:1` on NVIDIA. Each worker uses one GPU; `--threads` controls PyTorch CPU threads. Start with batch 1 when available VRAM is uncertain. A coordinator can limit requested batch sizes, and full-size model weights plus optimizer state must still fit. Reduce the batch if training runs out of memory; a successful tiny check is not a guarantee that a live lease will fit.
 
@@ -81,7 +81,7 @@ MacBook Air/Pro, iMac, Mac mini, Mac Studio and Mac Pro can use the Python worke
 
 Use [Apple's PyTorch installation guide](https://developer.apple.com/metal/pytorch/) and the [PyTorch installation selector](https://pytorch.org/get-started/locally/) for the selected release. Requirements change by release: Apple's guide currently lists Apple silicon and macOS 14+ for its documented stable build. Older releases have different requirements. Do not use the Linux CPU wheel index on macOS, install CUDA/ROCm packages on a Mac, or bypass unsupported-OS checks.
 
-For the MPS checks, use `dbmoe.py` from this GitHub repository in a fresh checkout. This MPS implementation has not yet been merged into the deployed anonymous worker. Do not assume a `/code` download supports MPS, or substitute this older token-based protocol into the live anonymous join flow. Use the live CPU join instructions above until the integrated MPS release is validated.
+For the MPS checks, use the current `dbmoe.py` from this repository or `/code`; both include the MPS path and anonymous protocol. The offline check runs before any credential read or network request. Physical Apple-hardware validation remains pending; do not infer support from mocked tests alone.
 
 ```sh
 python3 -m venv .venv
@@ -133,18 +133,35 @@ python dbmoe.py check-device --device rocm
 python dbmoe.py check-device --device mps
 ```
 
-The unit suite covers CPU training, optimizer-state reuse, coordinator delta validation, portable serialization, CPU/CUDA/ROCm/MPS device selection and privacy behavior. GPU selection is mocked where hardware is absent. Real CUDA/ROCm and MPS tests are explicitly skipped when that backend is unavailable. CPU tests passed on PyTorch 2.6.0+cpu; actual Apple, AMD and NVIDIA hardware validation remains pending.
+The current suite has 40 passing tests, including CPU training, optimizer-state reuse, coordinator delta validation, portable serialization, CPU/CUDA/ROCm/MPS device selection, privacy and Apple numerical fixtures. A separate 31-check attack/recovery suite plus a serve-only identity check passed: saturation and NaN rejection, honest updates, full-chain and one-hop inference, liar detection, restart and snapshot rollover. Physical CUDA/ROCm/MPS tests are skipped when that hardware is unavailable, so those paths remain unvalidated on real devices.
 
 ## How it works
 
 - Byte vocabulary of 256 with tied embedding/output weights.
-- Six blocks by default, each with two causal transformer layers and a top-1, four-expert feed-forward network.
-- Width 256, four attention heads and context length 256 by default.
+- The reference run has **1,611,827,201 parameters** in 24 blocks: width 1024, 16 heads, two transformer layers per block, eight experts and FFN 1728, with context 256.
 - Each block learns a separate diffusion-noise interval; workers need not exchange intermediate activations.
-- Workers receive leases over HTTPS and return parameter deltas; the coordinator validates tensor keys, shapes, finite values and delta bounds before merging.
+- Workers receive leases over HTTPS and return parameter deltas; the coordinator validates keys, shapes, finite values, step/token counts, saturation and delta bounds before merging.
+- Immediate block updates are checked against a retained lease sample and held-out text. Shared deltas are banked into rounds and checked separately at their actual commit.
+- Generation uses probability-flow Euler steps. The coordinator measures `chain` and `top` on real text and serves the better-scoring mode by default; both remain explicitly selectable.
+- One inference snapshot and one optimizer state are retained per worker to cap memory. Lease and block downloads are bounded to prevent large-model stampedes.
 - Payload loading uses `torch.load(..., weights_only=True)`.
 
 Validation is not a guarantee against malicious training updates. The current authenticated coordinator should be treated as experimental infrastructure.
+
+## 1.6B reference coordinator
+
+The reference configuration is 24 blocks, about **268.5 MB of FP32 block weights per lease** and a **6.45 GB** full checkpoint. Start it only with resources for that checkpoint and its gate evaluations. The public run keeps the previous 16M coordinator as a rollback lane.
+
+```sh
+python dbmoe.py coord --dir run-1p6b --host 127.0.0.1 --port 8791 \
+  --tokens tokens.json \
+  --hf "HuggingFaceFW/fineweb-edu:sample/10BT/*.parquet" \
+  --cfg '{"vocab":256,"d":1024,"heads":16,"layers_per_block":2,"blocks":24,"experts":8,"ffn":1728,"ctx":256,"aux":0.01}' \
+  --steps 4 --batch 1 --max-steps 16 --max-batch 4 \
+  --heldout 4 --eval-every 0 --snap-every 0 --max-upload-mb 768
+```
+
+Increase upload limits only as needed for the block size. Retained snapshots are disabled in this example because the checkpoint is large; use Hugging Face for verified backups. Every participant is gated by default, including trusted tokens. Daily participant and lifetime job caps are disabled; capacity backpressure, proof of work, lease slots and quality checks remain active.
 
 ## Local coordinator
 

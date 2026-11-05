@@ -1153,6 +1153,7 @@ class Coordinator:
         self.gate_strict, self.shared_bank, self.shared_round = False, {}, 12
         torch.set_num_threads(a.eval_threads)
         self.upload_slots = threading.BoundedSemaphore(4)
+        self.lease_slots = threading.BoundedSemaphore(4)   # bound large block/lease downloads, not participant count
         self.tok_path, self.tok_mtime, self.tokens = a.tokens, None, {}
         self.steps, self.batch, self.lr, self.ttl = a.steps, a.batch, a.lr, a.lease_ttl
         self.max_steps, self.max_batch = a.max_steps, a.max_batch
@@ -1555,7 +1556,7 @@ def serve(a):
 
         def setup(self):
             super().setup()
-            self.connection.settimeout(60)
+            self.connection.settimeout(600)
 
         def _reject(self, code, message):
             # Do not reuse connections with unread or invalid request bodies.
@@ -1679,10 +1680,15 @@ def serve(a):
                     why = C.blocked(who)
                     if why:
                         return self._send(403, dict(error=why))
-                    blob, why = C.net.block_blob(int(q.get('snap', 0)), int(q.get('block', -1)), who)
-                    if blob is None:
-                        return self._send(429 if why == 'slow down' else 404, dict(error=why))
-                    return self._send(200, blob, 'application/octet-stream')
+                    if not C.lease_slots.acquire(blocking=False):
+                        return self._send(429, dict(error='block download capacity reached; retry shortly'))
+                    try:
+                        blob, why = C.net.block_blob(int(q.get('snap', 0)), int(q.get('block', -1)), who)
+                        if blob is None:
+                            return self._send(429 if why == 'slow down' else 404, dict(error=why))
+                        return self._send(200, blob, 'application/octet-stream')
+                    finally:
+                        C.lease_slots.release()
                 if p == 'lease':
                     who = C.auth(self.headers)
                     if not who:
@@ -1690,9 +1696,14 @@ def serve(a):
                     why = C.blocked(who)
                     if why:
                         return self._send(403, dict(error=why))
-                    name = f"{who}/{q.get('name', 'worker')[:40]}"
-                    body = to_bytes(C.lease(name, int(q.get('steps') or 0), int(q.get('batch') or 0), q.get('session', '')[:32], owner=who, client=self._client()))
-                    return self._send(200, body, 'application/octet-stream')
+                    if not C.lease_slots.acquire(blocking=False):
+                        return self._send(429, dict(error='lease download capacity reached; retry shortly'))
+                    try:
+                        name = f"{who}/{q.get('name', 'worker')[:40]}"
+                        body = to_bytes(C.lease(name, int(q.get('steps') or 0), int(q.get('batch') or 0), q.get('session', '')[:32], owner=who, client=self._client()))
+                        return self._send(200, body, 'application/octet-stream')
+                    finally:
+                        C.lease_slots.release()
                 if p in ('', 'dbmoe', 'index.html'):
                     s = C.status()
                     ev = s['last_eval'] or {}
@@ -1771,7 +1782,7 @@ def serve(a):
             finally:
                 if slot:
                     C.upload_slots.release()
-                self.connection.settimeout(60)
+                self.connection.settimeout(600)
 
     srv = ThreadingHTTPServer((a.host, a.port), H)
     srv.daemon_threads = True

@@ -981,12 +981,15 @@ class NetInfer:
         return dict(job=job) if job else dict(idle=True, retry_s=0)
 
     def forget(self, owner, worker=None):
+        removed = set()
         with self.cv:
             for k in [k for k, q in self.peers.items() if q['owner'] == owner and (worker is None or q['worker'] == worker)]:
+                removed.add(self.peers[k]['worker'])
                 del self.peers[k]
                 slot = self.idle.pop(k, None)
                 if slot:
                     slot.event.set()
+        return removed
 
     # --- generation side of the router
     def coverage(self):
@@ -1323,16 +1326,20 @@ class Coordinator:
         """Take a participant's workers off the public list: all of them, or one by label.  Their accepted updates stay
         in the model and the totals, because they cannot be separated out; only the record goes."""
         prefix, one = f'{who}/', f'{who}/{name}' if name else None
+        # Collect identities before removing their last record. Never nest the
+        # inference condition and model lock: other paths use both independently.
+        gone = set(self.net.forget(who, one))
         with self.lock:
-            gone = [k for k in self.meta['workers'] if k.startswith(prefix) and (one is None or k == one)]
-            for k in gone:
+            trained = [k for k in self.meta['workers'] if k.startswith(prefix) and (one is None or k == one)]
+            gone.update(trained)
+            for k in trained:
                 del self.meta['workers'][k]
             for k in [k for k, v in self.leases.items() if v.get('owner') == who and (one is None or v['worker'] == one)]:
+                gone.add(self.leases[k]['worker'])
                 del self.leases[k]
             left = self.meta.setdefault('left_workers', [])
-            left.extend(self.alias(k) for k in gone)
+            left.extend(self.alias(k) for k in sorted(gone) if self.alias(k) not in left)
             del left[:-5000]
-        self.net.forget(who, one)
         tok = (headers.get('Authorization') or '').removeprefix('Bearer ').strip()
         ended = bool(not name and self.enrol and self.enrol.leave(tok))
         self.save()

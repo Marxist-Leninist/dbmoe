@@ -101,6 +101,30 @@ Use `--device xpu:1` for the second visible Intel GPU; `intel` and `intel:N` are
 
 `--share-hardware` keeps the existing opt-in behavior and can include the Intel GPU name, rounded total device memory and XPU build version when PyTorch exposes it. It does not send serials, hostnames or paths. Older coordinators may ignore the new optional `xpu` hardware label while accepting the unchanged CPU-delta wire format. The inference-serving path remains CPU-based; selecting XPU accelerates worker training only.
 
+### Intel integrated graphics and shared-memory budgeting
+
+Supported Intel integrated GPUs use the same `--device xpu` / `xpu:N` path. There is no separate iGPU kernel or name-based hardware override. **The following is PyTorch's validated hardware/OS matrix, not DBMoE physical-device test results.** The [PyTorch 2.15 guide](https://docs.pytorch.org/docs/2.15/notes/get_start_xpu.html), checked November 5, 2026, lists:
+
+- Core Ultra Arc graphics: Meteor Lake-H, Arrow Lake-H and Lunar Lake on Windows 11, Ubuntu 24.04/26.04 and WSL2 Ubuntu 24.04/26.04.
+- Core Ultra Series 3 / Panther Lake on Windows 11, Ubuntu 26.04 and WSL2 Ubuntu 24.04/26.04.
+
+Legacy Intel UHD/Iris Xe graphics and macOS are not in that validated XPU matrix. This feature does not promise support for them, Intel NPUs, or every processor carrying the Core Ultra name. An Intel CPU alone does not imply XPU GPU availability. Use `--device cpu` for a compatible CPU-only installation, or the separate MPS path on a supported Mac.
+
+Follow the [release-matched Intel prerequisites](https://www.intel.com/content/www/us/en/developer/articles/tool/pytorch-prerequisites-for-intel-gpu/2-15.html): Linux needs the supported Intel GPU driver/runtime; native Windows needs the supported Windows GPU driver; WSL2 uses the Windows host GPU driver and the Linux guest's user-mode compute runtime. Do not install a Linux kernel GPU driver inside WSL2 or assume the host's Python packages also install the guest environment. Official wheel users should follow the binary instructions rather than separately sourcing source-build toolkit environments. DBMoE does not require `torch.compile`.
+
+Integrated graphics share system RAM with the CPU. For a cautious first run, explicitly limit the XPU caching allocator and turn off additional CPU inference serving:
+
+```bash
+python dbmoe.py check-device --device xpu --xpu-memory-fraction 0.5
+python dbmoe.py worker --url https://codex.opentransformers.online/dbmoe --device xpu --xpu-memory-fraction 0.5 --steps 2 --batch 1 --threads 2 --no-serve
+```
+
+`--xpu-memory-fraction` applies PyTorch's [per-process allocator limit](https://docs.pytorch.org/docs/stable/generated/torch.xpu.memory.set_per_process_memory_fraction.html) to the selected GPU **before the offline training check or any credential/network access**. The value must be finite, greater than zero and at most one. It multiplies PyTorch's reported total device memory, not currently free memory. The local check prints the configured limit in GiB. If the API is missing or applying the cap fails, the worker stops instead of ignoring the requested budget. The flag is rejected on a CPU/CUDA/ROCm/MPS selection. Without it, existing PyTorch allocation behavior is unchanged.
+
+The example fraction is a conservative starting policy, not an Intel guarantee or a reservation. The cap covers PyTorch's XPU caching allocator, not CPU copies of leases, optimizer/checkpoint data, driver allocations, other applications, or total process/system RAM. Do not add reported iGPU memory and CPU RAM as separate pools. Leave headroom for the OS, reduce batch size or the fraction when needed, and stop if memory pressure or temperature rises. A full lease can exceed the cap even when the tiny check passes; that requires a smaller lease/model or more memory, not bypassing the cap. A supported iGPU may not expose a working free-memory query, so startup does not depend on `torch.xpu.mem_get_info()`.
+
+Local checks and optional hardware reports use PyTorch's `is_integrated_gpu` property to label memory as `shared` or `dedicated`; older builds without a boolean property report `unknown`. No GPU-name guessing is used. Shared capacity is neither free memory nor dedicated VRAM. These additions are tested with mocks and CPU training, not Intel GPU emulation or physical Intel hardware. They are repository changes, not a live-service deployment.
+
 ## Apple Mac (macOS)
 
 MacBook Air/Pro, iMac, Mac mini, Mac Studio and Mac Pro can use the Python worker **when their OS, architecture and PyTorch build are compatible**. Apple silicon uses `--device mps` for Metal GPU training or `--device cpu`. Intel Macs require a compatible x86_64 PyTorch release and can use the CPU route; do not assume a current Apple-silicon wheel, an AMD GPU inside an older Mac, or the newest PyTorch release supports that machine.
@@ -163,7 +187,7 @@ python dbmoe.py check-device --device mps
 python dbmoe.py check-device --device xpu
 ```
 
-The suite covers CPU training, optimizer-state reuse, coordinator delta validation, portable serialization, CPU/CUDA/ROCm/XPU/MPS device selection, privacy and Apple numerical fixtures. Intel tests also cover missing XPU APIs, invalid GPU indexes, explicit-device failure before credential/network access, selected-device preflight and opt-in metadata. Physical CUDA/ROCm/XPU/MPS tests are skipped when that hardware is unavailable. The Intel addition has only been tested on CPU with mocked XPU routing; physical Intel validation remains pending. A separate prior 31-check attack/recovery suite plus a serve-only identity check passed: saturation and NaN rejection, honest updates, full-chain and one-hop inference, liar detection, restart and snapshot rollover.
+The suite covers CPU training, optimizer-state reuse, coordinator delta validation, portable serialization, CPU/CUDA/ROCm/XPU/MPS device selection, privacy and Apple numerical fixtures. Intel tests also cover missing XPU APIs, invalid GPU indexes, explicit-device failure before credential/network access, selected-device preflight and opt-in metadata. Integrated-GPU tests cover shared/unknown memory labels, allocator caps applied before training, invalid budgets, missing/failing allocator APIs, and startup without free-memory queries. Physical CUDA/ROCm/XPU/MPS tests are skipped when that hardware is unavailable. The Intel addition has only been tested on CPU with mocked XPU routing; physical Intel validation remains pending. A separate prior 31-check attack/recovery suite plus a serve-only identity check passed: saturation and NaN rejection, honest updates, full-chain and one-hop inference, liar detection, restart and snapshot rollover.
 
 ## How it works
 

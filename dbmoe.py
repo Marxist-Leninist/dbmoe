@@ -110,11 +110,6 @@ DEFAULT_CFG = dict(vocab=256, d=256, heads=4, layers_per_block=2, blocks=6, expe
 CFG_1P6B = dict(vocab=256, d=1024, heads=16, layers_per_block=2, blocks=24, experts=8, ffn=1728, ctx=256, aux=0.01)
 
 
-def portable_expert_counts(top_i, experts):
-    """Fixed-size expert histogram without bincount, which some MPS builds lack."""
-    return (top_i[:, None] == torch.arange(experts, device=top_i.device)[None, :]).sum(0)
-
-
 def make_cfg(over=None):
     cfg = dict(DEFAULT_CFG)
     cfg.update(over or {})
@@ -149,6 +144,7 @@ class MoE(nn.Module):
             if idx.numel():
                 h = F.gelu(flat.index_select(0, idx) @ self.w1[e]) @ self.w2[e]
                 out.index_add_(0, idx, h * top_p.index_select(0, idx)[:, None].to(h.dtype))
+        # bincount is unavailable on some MPS releases; the selected expert ids are unchanged.
         counts = portable_expert_counts(top_i, self.E) if top_i.device.type == 'mps' else torch.bincount(top_i, minlength=self.E)
         frac = counts.float() / max(1, top_i.numel())
         aux = self.E * (frac.detach() * prob.mean(0)).sum()
@@ -260,8 +256,8 @@ def sample_sigma(cfg, lo, hi, n, device='cpu'):
     """sigma ~ the log-normal noise distribution restricted to [lo, hi]: each block sees its part of one global distribution."""
     pm, ps = cfg['sig_pm'], cfg['sig_ps']
     a, b = _cdf((math.log(lo) - pm) / ps), _cdf((math.log(hi) - pm) / ps)
-    q = torch.empty(n, device=device).uniform_(a, b).clamp(1e-6, 1 - 1e-6)
-    return torch.exp(pm + ps * math.sqrt(2) * torch.erfinv(2 * q - 1))
+    q = torch.empty(n).uniform_(a, b).clamp(1e-6, 1 - 1e-6)     # on the CPU: erfinv is not on every GPU backend
+    return torch.exp(pm + ps * math.sqrt(2) * torch.erfinv(2 * q - 1)).to(device)
 
 
 @torch.no_grad()
@@ -408,7 +404,7 @@ def evaluate_generation(model, x, teacher, n=48, prompt_len=32, ctx_len=128, see
     gen = torch.Generator().manual_seed(seed)
     x = x.long()
     out = dict(real_bits=round(sum(teacher.bits(r) for r in x[:, 1:]) / x.size(0), 4))
-    for name, top, temp in modes or (('chain', False, 0.0), ('top', True, 0.7)):
+    for name, top, temp in modes or (('chain', False, 0.0), ('top', True, 0.75)):
         ids = x[:, :prompt_len].clone()
         for _ in range(n):
             w = ids[:, -ctx_len:]
@@ -567,11 +563,28 @@ By hand, also on Windows (use py instead of python3 there, and curl.exe in Power
   curl -fsSL {base}/code -o dbmoe.py
   python3 dbmoe.py worker [--device cuda|rocm|xpu|mps] [--threads 4] [--hours 1]
 Want your own token first?  python3 dbmoe.py enrol   (optional; the worker does this by itself)
+Many machines, one identity: python3 dbmoe.py enrol, copy worker.token to each one, run python3 dbmoe.py worker --token @worker.token --name MACHINE
 AMD GPUs need a ROCm build of PyTorch: https://github.com/Marxist-Leninist/dbmoe#amd-gpus-rocm
+Macs: https://github.com/Marxist-Leninist/dbmoe#apple-mac-macos
 Intel GPUs need an XPU build of PyTorch: https://github.com/Marxist-Leninist/dbmoe#intel-gpus-xpu
 The worker gets its own credential by itself, trains one block at a time and serves that block for network inference
 (--no-serve turns serving off).  Every update is tested on held-out text before it is merged.  Ctrl+C stops it.
+Leaving for good: curl -fsSL {base}/leave.sh | sh     (or python3 dbmoe.py leave; takes you off the public list and ends your credential)
 Live status: {base}/status     Sample text: {base}/sample?prompt=The%20&n=120     Network sample: {base}/sample?net=1&prompt=The%20&n=32
+"""
+
+LEAVE_SH = r"""#!/bin/sh
+# Leave the dbmoe network for good: your workers come off the public list and your credential stops working.
+# What you already contributed stays in the model, because it cannot be separated out.  You can rejoin at any time.
+set -eu
+BASE="@BASE@"
+if command -v sha256sum >/dev/null 2>&1; then H=$(printf %s "$BASE" | sha256sum | cut -c1-12); else H=$(printf %s "$BASE" | shasum -a 256 | cut -c1-12); fi
+F="$HOME/.dbmoe/$H.token"
+[ -s "$F" ] || { echo "No saved credential at $F. If you minted your own, use: python3 dbmoe.py leave --token @worker.token" >&2; exit 1; }
+printf 'Authorization: Bearer %s\n' "$(cat "$F")" | curl -fsS -X POST -H @- -H 'Content-Type: application/json' -d '{}' "$BASE/leave"
+rm -f "$F" "$HOME/.dbmoe/worker-name"
+echo
+echo "You have left. Any worker still running stops by itself. Your files in ~/dbmoe-worker are yours to delete."
 """
 
 JOIN_SH = r"""#!/bin/sh
@@ -591,7 +604,7 @@ if ! "$PY" -c 'import torch' 2>/dev/null; then
   if ! "$PY" -c 'import torch' 2>/dev/null; then
     echo "Installing PyTorch (CPU build) into $DIR/venv ..."
     "$PY" -m pip install --quiet --upgrade pip
-    "$PY" -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+    if [ "$(uname -s)" = Darwin ]; then "$PY" -m pip install --quiet torch; else "$PY" -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu; fi
   fi
 fi
 curl -fsSL "$BASE/code" -o dbmoe.py.new
@@ -623,7 +636,7 @@ class Enrolment:
     def __init__(self, path, bits=18, per_client_day=0, global_day=0, ttl=600):
         self.path, self.bits, self.per_client_day, self.global_day, self.ttl = path, bits, per_client_day, global_day, ttl
         self.idle_ttl = 30 * 86400  # activity renews this horizon; no lifetime limit
-        self.lock, self.spent, self.drift = threading.Lock(), {}, {}
+        self.lock, self.spent = threading.Lock(), {}
         if os.path.exists(path):
             with open(path) as f:
                 self.db = json.load(f)
@@ -695,6 +708,22 @@ class Enrolment:
     def known(self, pid):
         return pid in self.by_id
 
+    def leave(self, tok):
+        """A participant leaving for good: the credential stops working at once.  Only its hash is remembered, so a
+        worker still running with it can be told to stop instead of quietly signing up again."""
+        h = hashlib.sha256(tok.encode()).hexdigest()
+        with self.lock:
+            r = self.db['participants'].pop(h, None)
+            if not r:
+                return False
+            self.by_id.pop(r['id'], None)
+            self.db.setdefault('left', {})[h] = time.time()
+            self._save()
+            return True
+
+    def has_left(self, tok):
+        return hashlib.sha256(tok.encode()).hexdigest() in self.db.get('left', {})
+
     def blocked(self, pid):
         r = self.by_id.get(pid)
         if r and r['until'] > time.time():
@@ -706,14 +735,7 @@ class Enrolment:
             r = self.by_id.get(pid)
             if r:
                 r['ok'] += 1
-                r['fails'] = 0
-
-    def note_drift(self, pid, rel):
-        """A leaky running total of how much this participant's updates have worsened held-out loss.  Honest work hovers
-        around zero or below; many small harmful updates, each inside the per-update tolerance, do not."""
-        with self.lock:
-            self.drift[pid] = 0.8 * self.drift.get(pid, 0.0) + rel
-            return self.drift[pid]
+                r['fails'] = max(0, r['fails'] - 0.25)  # a leaky count: someone failing half the time still gets stopped
 
     def strike(self, pid, weight=1):
         with self.lock:
@@ -745,32 +767,59 @@ def gate_loss(cfg, sigmas, x, b, shared, block):
 
 
 @torch.no_grad()
-def gate_measure(cfg, sigmas, x, b, o, sh_sd, b_sd, o_sd, d_shared, d_block, w_shared, w_block):
-    shared, block, other = Shared(cfg), Block(cfg), Block(cfg)
+def round_measure(cfg, sigmas, x, sh_sd, blocks, delta):
+    """Held-out loss on each of these blocks, before and after a round of shared-parameter deltas: {block: [before, after]}."""
+    shared, block, out = Shared(cfg), Block(cfg), {}
     shared.load_state_dict(sh_sd)
-    block.load_state_dict(b_sd)
-    other.load_state_dict(o_sd)
-    shared.eval(), block.eval(), other.eval()
-    before, o_before = gate_loss(cfg, sigmas, x, b, shared, block), gate_loss(cfg, sigmas, x, o, shared, other)
+    shared.eval(), block.eval()
+    for b, sd in blocks.items():
+        block.load_state_dict(sd)
+        out[b] = [gate_loss(cfg, sigmas, x, b, shared, block)]
     for k, p in shared.state_dict().items():
-        p.add_(d_shared[k].to(p.dtype), alpha=w_shared)
-    for k, p in block.state_dict().items():
-        p.add_(d_block[k].to(p.dtype), alpha=w_block)
-    return before, gate_loss(cfg, sigmas, x, b, shared, block), o_before, gate_loss(cfg, sigmas, x, o, shared, other)
+        p.add_(delta[k].to(p.dtype))
+    for b, sd in blocks.items():
+        block.load_state_dict(sd)
+        out[b].append(gate_loss(cfg, sigmas, x, b, shared, block))
+    return out
 
 
 @torch.no_grad()
-def gate_learning_measure(cfg, sigmas, x, b, sh_sd, b_sd, d_shared, d_block, w_shared, w_block):
-    """Measure learning on a retained sample of this lease at the exact proposed merge weights."""
+def gate_measure(cfg, sigmas, x, b, o, sh_sd, b_sd, o_sd, d_shared, d_block, w_shared, w_block, trained, margin):
+    """Cheapest and strongest first.  At full weight, did the update lower the loss on text from its own lease?  Noise and
+    empty uploads stop there.  Only then, on held-out text: its block part at the weight it merges with, which happens at
+    once, and on its own its shared part at the most that can count for in a round."""
     shared, block = Shared(cfg), Block(cfg)
-    shared.load_state_dict(sh_sd), block.load_state_dict(b_sd)
+    shared.load_state_dict(sh_sd)
+    block.load_state_dict(b_sd)
     shared.eval(), block.eval()
-    before = gate_loss(cfg, sigmas, x, b, shared, block)
-    for k, p in shared.state_dict().items():
-        p.add_(d_shared[k].to(p.dtype), alpha=w_shared)
-    for k, p in block.state_dict().items():
-        p.add_(d_block[k].to(p.dtype), alpha=w_block)
-    return before, gate_loss(cfg, sigmas, x, b, shared, block)
+
+    def nudge(w_s, w_b):
+        for k, p in shared.state_dict().items():
+            p.add_(d_shared[k].to(p.dtype), alpha=w_s)
+        for k, p in block.state_dict().items():
+            p.add_(d_block[k].to(p.dtype), alpha=w_b)
+
+    m = dict(trained_before=gate_loss(cfg, sigmas, trained, b, shared, block), before=None, after=None, shared_after=None, other_before=None, other_after=None)
+    nudge(1.0, 1.0)
+    m['trained_after'] = gate_loss(cfg, sigmas, trained, b, shared, block)
+    if not m['trained_after'] < m['trained_before'] * (1 - margin):     # also true for NaN
+        return m
+    shared.load_state_dict(sh_sd)
+    block.load_state_dict(b_sd)
+    m['before'] = gate_loss(cfg, sigmas, x, b, shared, block)
+    if o is not None:
+        other = Block(cfg)
+        other.load_state_dict(o_sd)
+        other.eval()
+        m['other_before'] = gate_loss(cfg, sigmas, x, o, shared, other)
+    nudge(0.0, w_block)
+    m['after'] = gate_loss(cfg, sigmas, x, b, shared, block)
+    block.load_state_dict(b_sd)
+    nudge(w_shared, 0.0)
+    m['shared_after'] = gate_loss(cfg, sigmas, x, b, shared, block)
+    if o is not None:
+        m['other_after'] = gate_loss(cfg, sigmas, x, o, shared, other)
+    return m
 
 
 def encode_floats(t):
@@ -806,7 +855,7 @@ class NetInfer:
     Workers hold one block of a frozen snapshot and long-poll for hops.  Snapshots roll every `refresh` seconds; the
     last two stay live here, so hops from a worker that has not refreshed yet can still be checked."""
     def __init__(self, C, refresh=600.0, poll_s=20.0, hop_timeout=5.0, retries=2, idle_wait=3.0, spb=STEPS_PER_BLOCK, ctx_len=128,
-                 audit_trusted=0.02, audit_open=0.25, max_peers=2048, online_s=45.0):
+                 audit_trusted=0.25, audit_open=0.25, max_peers=2048, online_s=45.0):
         self.C, self.refresh, self.poll_s, self.hop_timeout, self.retries = C, refresh, poll_s, hop_timeout, retries
         self.idle_wait, self.spb, self.ctx_len, self.audit_trusted, self.audit_open = idle_wait, spb, ctx_len, audit_trusted, audit_open
         self.max_peers, self.online_s = max_peers, online_s
@@ -828,7 +877,7 @@ class NetInfer:
             sid = max(int(time.time()), (self.current or 0) + 1)
             self.snaps[sid] = dict(id=sid, model=m, updates=updates, t=time.time(), blobs={})
             self.current = sid
-            while len(self.snaps) > 1:                 # one full model in RAM, not a second 1.6B copy
+            while len(self.snaps) > 2:
                 self.snaps.popitem(last=False)
             for slot in self.idle.values():             # wake parked workers so they can pick up the new weights
                 slot.event.set()
@@ -857,7 +906,7 @@ class NetInfer:
                 return None, 'unknown snapshot or block'
             if self.C.is_open(owner):
                 t = time.time()
-                if t - self.last_fetch.get(owner, 0) < 15:
+                if t - self.last_fetch.get(owner, 0) < 15 / max(1, sum(q['owner'] == owner for q in self.peers.values())):
                     return None, 'slow down'
                 self.last_fetch[owner] = t
             blob = s['blobs'].get(block)
@@ -899,7 +948,7 @@ class NetInfer:
         with self.cv:
             p = self.peers.get(key)
             if p is None:
-                if len(self.peers) >= self.max_peers or (is_open and sum(q['owner'] == owner for q in self.peers.values()) >= 16):
+                if len(self.peers) >= self.max_peers or (is_open and sum(q['owner'] == owner for q in self.peers.values()) >= 256):
                     return dict(idle=True, retry_s=60)
                 p = self.peers[key] = dict(owner=owner, worker=worker, open=is_open, target=None, ewma=200.0, hops=0, strikes=0, banned=False)
             p.update(seen=now, snap=snap, block=block)
@@ -931,6 +980,17 @@ class NetInfer:
                 del self.idle[key]
             job = slot.job
         return dict(job=job) if job else dict(idle=True, retry_s=0)
+
+    def forget(self, owner, worker=None):
+        removed = set()
+        with self.cv:
+            for k in [k for k, q in self.peers.items() if q['owner'] == owner and (worker is None or q['worker'] == worker)]:
+                removed.add(self.peers[k]['worker'])
+                del self.peers[k]
+                slot = self.idle.pop(k, None)
+                if slot:
+                    slot.event.set()
+        return removed
 
     # --- generation side of the router
     def coverage(self):
@@ -1082,8 +1142,8 @@ class NetInfer:
             self.stats['hops_coordinator'] += 1
         return zl, lg, dict(block=job['block'], via='coordinator', ms=round((time.time() - t0) * 1000))
 
-    def generate(self, prompt, n, temp=0.0, top_k=40, seed=0, mode='chain'):
-        """Yield JSON-ready events as the bytes are produced, using the full chain or only the top block."""
+    def generate(self, prompt, n, temp=0.0, top_k=40, seed=0, sampler='chain'):
+        """Yield JSON-ready events as the bytes are produced."""
         cfg, sig = self.C.model.cfg, self.C.model.sigmas
         B, spb = cfg['blocks'], self.spb
         gen = torch.Generator().manual_seed(seed)
@@ -1091,7 +1151,7 @@ class NetInfer:
         with self.cv:
             s0 = self.snaps[self.current]
         t_start, out, used, on_net, on_coord = time.time(), 0, set(), 0, 0
-        yield dict(t='start', n=n, prompt_bytes=len(ids), mode=mode, coverage=self.coverage(), snapshot_updates=s0['updates'],
+        yield dict(t='start', n=n, prompt_bytes=len(ids), coverage=self.coverage(), snapshot_updates=s0['updates'],
                    snapshot_age_s=round(time.time() - s0['t']))
         try:
             for k in range(n):
@@ -1100,12 +1160,10 @@ class NetInfer:
                 ek_seed = int(torch.randint(2 ** 31 - 1, (1,), generator=gen))
                 zl = torch.randn(1, 1, cfg['d'], generator=gen) * sig[-1]
                 lg, hops = None, []
-                blocks = [B - 1] if mode == 'top' else list(reversed(range(B)))
-                for i in blocks:
-                    top = mode == 'top'
-                    zl, lg, info = self.hop(dict(block=i, ids=raw, seed=ek_seed, z=encode_floats(zl),
-                                                 grid=[sig[-1], sig[-2]] if top else block_grid(sig, i, spb),
-                                                 final=True if top else i == 0, exit_conf=0.0 if top else EXIT_CONF))
+                for i in ([B - 1] if sampler == 'top' else reversed(range(B))):
+                    grid = [sig[-1], sig[-2]] if sampler == 'top' else block_grid(sig, i, spb)
+                    zl, lg, info = self.hop(dict(block=i, ids=raw, seed=ek_seed, z=encode_floats(zl), grid=grid,
+                                                 final=sampler == 'top' or i == 0, exit_conf=EXIT_CONF))
                     hops.append(info)
                     if info['via'] == 'coordinator':
                         on_coord += 1
@@ -1135,6 +1193,8 @@ class NetInfer:
             cov, st = self.coverage(), dict(self.stats)
             s = self.snaps[self.current]
             online = sum(now - q['seen'] < self.online_s and not q['banned'] for q in self.peers.values())
+            peers = {self.C.alias(q['worker']): dict(block=q.get('block'), hops=q['hops'], ms=round(q['ewma']))
+                     for q in self.peers.values() if now - q['seen'] < self.online_s and not q['banned']}
             banned = sum(q['banned'] for q in self.peers.values())
             recent = [r for r in self.recent if now - r['t'] < 3600]
             last = dict(self.recent[-1]) if self.recent else None
@@ -1143,7 +1203,7 @@ class NetInfer:
         if last:
             last['age_s'] = round(now - last.pop('t'))
         st['seconds'] = round(st['seconds'], 1)
-        return dict(online_workers=online, banned_workers=banned, coverage=cov, covered_blocks=sum(c > 0 for c in cov), blocks=len(cov),
+        return dict(online_workers=online, banned_workers=banned, peers=peers, coverage=cov, covered_blocks=sum(c > 0 for c in cov), blocks=len(cov),
                     ready=all(c > 0 for c in cov), snapshot=dict(updates=s['updates'], age_s=round(now - s['t'])),
                     bytes_per_s_last_hour=round(sum(r['bytes'] for r in recent) / secs, 3) if secs else None,
                     network_hop_share=round(st['hops_network'] / hops, 4) if hops else None, last_generation=last, **st)
@@ -1154,21 +1214,25 @@ class NetInfer:
 class Coordinator:
     def __init__(self, a):
         self.dir = a.dir
+        self.rate_started_at = time.time()  # Fresh process boundary for accepted-update throughput.
         os.makedirs(os.path.join(self.dir, 'snapshots'), exist_ok=True)
         self.path = os.path.join(self.dir, 'master.pt')
         self.log_path = os.path.join(self.dir, 'events.jsonl')
         self.lock = threading.RLock()
         self.save_lock = threading.Lock()
         self.pending_leases = {}
-        self.max_identity_leases = 4
+        self.pending_workers = set()
+        self.max_identity_leases = 256
         self.max_active_leases = 512                    # what one coordinator can serve, not a limit on people
         self.reserved_leases = 8                        # only tokens from tokens.json can use these
-        self.max_open_leases = 16                       # per credential; the oldest is dropped beyond this
+        self.max_open_leases = 256                      # per credential, so one token can cover a whole network of machines
         self.open_lease_interval, self.last_open_lease = 2.0, {}
         self.gate_strict, self.shared_bank, self.shared_round = False, {}, 12
+        self.round_busy, self.block_gates = False, collections.defaultdict(threading.Lock)
+        self.gate_drift, self.check_windows, self.min_steps = {}, 6, a.min_steps
         torch.set_num_threads(a.eval_threads)
-        self.upload_slots = threading.BoundedSemaphore(4)
-        self.lease_slots = threading.BoundedSemaphore(4)   # bound large block/lease downloads, not participant count
+        self.upload_slots = threading.BoundedSemaphore(32)
+        self.gate_slots = threading.BoundedSemaphore(2)     # tests run two at a time; uploads wait their turn
         self.tok_path, self.tok_mtime, self.tokens = a.tokens, None, {}
         self.steps, self.batch, self.lr, self.ttl = a.steps, a.batch, a.lr, a.lease_ttl
         self.max_steps, self.max_batch = a.max_steps, a.max_batch
@@ -1200,15 +1264,9 @@ class Coordinator:
         else:
             self.gate_x = self.data.windows(a.gate_windows, self.model.cfg['ctx'])
             torch.save(self.gate_x, gp)
-        self.gate_all, self.gate_tol = True, a.gate_tol
-        self.learn_margin = max(0.0, float(getattr(a, 'learn_margin', 0.0)))
-        tp = os.path.join(self.dir, 'teacher.pt')       # about 4 MB of real text; only its n-gram statistics are used
-        if os.path.exists(tp):
-            tx = torch.load(tp, weights_only=True)
-        else:
-            tx = self.data.windows(16000, self.model.cfg['ctx'])
-            torch.save(tx, tp)
-        self.teacher = Teacher(tx)
+        self.gate_all, self.gate_tol = a.gate_all, a.gate_tol
+        self.teacher, self.gate_recent, self.learn_margin = None, collections.deque(maxlen=200), a.learn_margin
+        threading.Thread(target=self._load_teacher, daemon=True).start()
         self.enrol = Enrolment(os.path.join(self.dir, 'enrolled.json'), bits=a.join_bits, per_client_day=a.join_per_client_day,
                                global_day=a.join_per_day) if a.open_join else None
         self.save()
@@ -1259,6 +1317,36 @@ class Coordinator:
     def blocked(self, owner):
         return self.enrol.blocked(owner) if self.is_open(owner) else None
 
+    def auth_failure(self, headers):
+        tok = (headers.get('Authorization') or '').removeprefix('Bearer ').strip()
+        if tok and self.enrol and self.enrol.has_left(tok):
+            return 410, 'this credential has left the run; start the worker again to rejoin with a new one'
+        return 401, 'missing or unknown token'
+
+    def leave(self, who, headers, name=None):
+        """Take a participant's workers off the public list: all of them, or one by label.  Their accepted updates stay
+        in the model and the totals, because they cannot be separated out; only the record goes."""
+        prefix, one = f'{who}/', f'{who}/{name}' if name else None
+        # Collect identities before removing their last record. Never nest the
+        # inference condition and model lock: other paths use both independently.
+        gone = set(self.net.forget(who, one))
+        with self.lock:
+            trained = [k for k in self.meta['workers'] if k.startswith(prefix) and (one is None or k == one)]
+            gone.update(trained)
+            for k in trained:
+                del self.meta['workers'][k]
+            for k in [k for k, v in self.leases.items() if v.get('owner') == who and (one is None or v['worker'] == one)]:
+                gone.add(self.leases[k]['worker'])
+                del self.leases[k]
+            left = self.meta.setdefault('left_workers', [])
+            left.extend(self.alias(k) for k in sorted(gone) if self.alias(k) not in left)
+            del left[:-5000]
+        tok = (headers.get('Authorization') or '').removeprefix('Bearer ').strip()
+        ended = bool(not name and self.enrol and self.enrol.leave(tok))
+        self.save()
+        self.log(ev='left', participant=who, name=name, records=len(gone), credential_ended=ended)
+        return dict(ok=True, removed=len(gone), credential_ended=ended)
+
     def has_lease(self, owner):
         with self.lock:
             self.expire()
@@ -1280,25 +1368,31 @@ class Coordinator:
         # Reserve capacity before consuming data, including concurrent requests.
         with self.lock:
             self.expire()
+            key = (owner, worker)
+            if key in self.pending_workers:
+                raise LeaseCapacityError('lease request already pending for this worker; retry shortly')
             pending = self.pending_leases.get(owner, 0)
             if is_open:
                 t = time.time()
-                if t - self.last_open_lease.get(owner, 0) < self.open_lease_interval:
+                if t - self.last_open_lease.get(worker, 0) < self.open_lease_interval:     # each machine, so one token can run a whole network of them
                     raise LeaseCapacityError('too many lease requests; slow down')
-                self.last_open_lease[owner] = t
-                mine = sorted((k for k, v in self.leases.items() if v.get('owner') == owner), key=lambda k: self.leases[k]['t0'])
-                if mine and len(mine) + pending >= self.max_open_leases:    # a crash loop must not lock a volunteer out for the TTL
-                    self.log(ev='lease_abandoned', lease=mine[0], block=self.leases.pop(mine[0])['block'], worker=worker)
-            live = list(self.leases.values())
+                if len(self.last_open_lease) > 20000:
+                    self.last_open_lease = {k: v for k, v in self.last_open_lease.items() if t - v < 60}
+                self.last_open_lease[worker] = t
+            live = [v for v in self.leases.values() if not (v['worker'] == worker and v.get('owner', v['worker'].split('/', 1)[0]) == owner)]     # the same owner's stable worker replaces its prior job, including after restart
+            replacing = len(live) < len(self.leases)
             own = sum(v.get('owner', v['worker'].split('/', 1)[0]) == owner for v in live)
             total = len(live) + sum(self.pending_leases.values())
-            if own + pending >= (self.max_open_leases if is_open else self.max_identity_leases) or total >= self.max_active_leases - (self.reserved_leases if is_open else 0):
+            cap = self.max_open_leases if is_open else self.max_identity_leases
+            if own + pending >= cap or total >= self.max_active_leases - (self.reserved_leases if is_open and not replacing else 0):
                 raise LeaseCapacityError('active lease capacity reached; finish existing work first')
             self.pending_leases[owner] = pending + 1
+            self.pending_workers.add(key)
         try:
             return self._lease(worker, steps, batch, session, owner, client)
         finally:
             with self.lock:
+                self.pending_workers.discard(key)
                 left = self.pending_leases[owner] - 1
                 if left:
                     self.pending_leases[owner] = left
@@ -1306,26 +1400,25 @@ class Coordinator:
                     self.pending_leases.pop(owner, None)
 
     def _lease(self, worker, steps, batch, session='', owner=None, client=None):
-        steps = max(1, min(self.max_steps, steps or self.steps))
+        steps = max(self.min_steps, min(self.max_steps, steps or self.steps))
         batch = max(1, min(self.max_batch, batch or self.batch))
         data = self.data.windows(steps * batch, self.model.cfg['ctx'])      # before taking the lock (may wait on HF)
         with self.lock:
             self.expire()
-            for k in [k for k, v in self.leases.items() if v['worker'] == worker and v['session'] == session]:
+            for k in [k for k, v in self.leases.items() if v['worker'] == worker and v.get('owner', v['worker'].split('/', 1)[0]) == owner]:
                 self.log(ev='lease_abandoned', lease=k, block=self.leases.pop(k)['block'], worker=worker)
             B, bu = self.model.cfg['blocks'], self.meta['block_updates']
             active = [0] * B
             for v in self.leases.values():
                 active[v['block']] += 1
-            cand = [i for i in range(B) if active[i] == min(active)]
             w = self.meta['workers'].get(worker) or {}
             wt = self.block_weights()
-            need = [bu[i] / wt[i] for i in range(B)]    # updates per unit of what the block still has to learn: lowest goes next
-            last, low = w.get('last_block'), min(need[i] for i in cand)
-            if last in cand and need[last] <= low + 2:
+            share = [wt[i] / (1 + active[i]) for i in range(B)]     # what each block has left to learn, spread over who is already on it
+            last = w.get('last_block')
+            if last in range(B) and random.random() < 0.8 and share[last] >= max(share) / 2:
                 b = last                     # sticky: the worker keeps its optimizer state for this block
             else:
-                b = min(cand, key=lambda i: (need[i], random.random()))
+                b = random.choices(range(B), weights=share)[0]
             for v in self.leases.values():
                 v['all'] += 1
                 v['same'] += v['block'] == b
@@ -1334,15 +1427,26 @@ class Coordinator:
             lid = secrets.token_hex(8)
             self.leases[lid] = dict(block=b, worker=worker, owner=owner, client=client, session=session, t0=time.time(), ttl=ttl, steps=steps, batch=batch,
                                     same=active[b] + 1, all=len(self.leases) + 1)
-            probe_rng = torch.Generator().manual_seed(secrets.randbits(63))
-            probe_idx = torch.randperm(data.size(0), generator=probe_rng)[:min(8, data.size(0))]
-            self.leases[lid]['validation_data'] = data[probe_idx].clone()
+            self.leases[lid]['check'] = data[torch.randperm(data.size(0))[:self.check_windows]].clone()
             payload = dict(version=VERSION, lease=lid, block=b, block_version=bu[b], cfg=self.model.cfg, sigmas=self.model.sigmas,
                            shared={k: v.clone() for k, v in self.model.shared.state_dict().items()},
                            block_state={k: v.clone() for k, v in self.model.blocks[b].state_dict().items()},
                            steps=steps, batch=batch, lr=self.lr, ttl=ttl, data=data)
         self.log(ev='lease', lease=lid, block=b, worker=worker, steps=steps, batch=batch, ttl=round(ttl))
         return payload
+
+    def _load_teacher(self):
+        """About 4 MB of real text; only its n-gram statistics are used.  In the background, so a restart does not wait for it."""
+        tp = os.path.join(self.dir, 'teacher.pt')
+        try:
+            if os.path.exists(tp):
+                tx = torch.load(tp, weights_only=True)
+            else:
+                tx = self.data.windows(16000, self.model.cfg['ctx'])
+                torch.save(tx, tp)
+            self.teacher = Teacher(tx)
+        except Exception as e:
+            print(f'[coord] teacher: {e!r}', flush=True)
 
     def block_weights(self):
         """How much compute each block deserves.  Low-noise blocks can read the target off z, which is their job, so their
@@ -1354,53 +1458,58 @@ class Coordinator:
         return [max(0.25, c * B / sum(ev)) for c in ev]
 
     def _bank_shared(self, b, d):
-        """Bank shared deltas, then test and apply the exact round at its actual merge, separately from block updates."""
+        """Shared parameters define the target every block denoises toward, so they must not drift under one block's
+        gradients between other blocks' leases.  Deltas wait here and go in together as one round."""
         bank = self.shared_bank.setdefault(b, dict(n=0, sum={k: torch.zeros_like(v) for k, v in d.items()}))
         bank['n'] += 1
         for k, v in d.items():
             bank['sum'][k].add_(v)
-        if sum(v['n'] for v in self.shared_bank.values()) < self.shared_round:
-            return
-        wt = self.block_weights()
-        merged = {}
-        for i, v in self.shared_bank.items():
-            alpha = wt[i] / sum(wt) / v['n']
-            for k, value in v['sum'].items():
-                if k not in merged:
-                    merged[k] = torch.zeros_like(value)
-                merged[k].add_(value, alpha=alpha)
-        o = (b + 1) % self.model.cfg['blocks']
-        sh = {k: v.clone() for k, v in self.model.shared.state_dict().items()}
-        bs = {k: v.clone() for k, v in self.model.blocks[b].state_dict().items()}
-        xs = {k: v.clone() for k, v in self.model.blocks[o].state_dict().items()}
-        zero_block = {k: torch.zeros_like(v) for k, v in bs.items()}
-        learned_before, learned_after = gate_learning_measure(self.model.cfg, self.model.sigmas, self.gate_x, b, sh, bs,
-                                                              merged, zero_block, 1.0, 0.0)
-        before, after, o_before, o_after = gate_measure(self.model.cfg, self.model.sigmas, self.gate_x, b, o, sh, bs, xs,
-                                                        merged, zero_block, 1.0, 0.0)
-        tol, slack = (0.0, 0.0) if self.gate_strict else (self.gate_tol, 0.01)
-        learned = math.isfinite(learned_after) and learned_after < learned_before * (1.0 - self.learn_margin)
-        ok = learned and math.isfinite(after) and math.isfinite(o_after) and after <= before * (1 + tol) + slack and o_after <= o_before * (1 + tol) + slack
-        self.log(ev='shared_gate', block=b, other=o, before=round(before, 5), after=round(after, 5),
-                 other_before=round(o_before, 5), other_after=round(o_after, 5), learned_before=round(learned_before, 5),
-                 learned_after=round(learned_after, 5), learned=learned, ok=ok)
-        self.shared_bank.clear()
-        if not ok:
-            self.meta['rejected'] += 1
-            return
-        for k, p in self.model.shared.state_dict().items():
-            p.add_(merged[k].to(p.dtype))
-        self.meta['shared_rounds'] = self.meta.get('shared_rounds', 0) + 1
+        if sum(v['n'] for v in self.shared_bank.values()) >= self.shared_round and not self.round_busy:
+            self.round_busy = True
+            threading.Thread(target=self._commit_round, args=(self.shared_bank,), daemon=True).start()
+            self.shared_bank = {}
+
+    def _commit_round(self, bank):
+        """A round is what really changes the shared parameters, so it gets its own test, weighted by block_weights(), on
+        the top block and one other.  Each delta in it passed alone; this catches what they do together.  Merges wait while
+        it runs, so what is tested is exactly what goes in, and no update under test sees the shared parameters change."""
+        held = []
+        try:
+            for i in range(self.model.cfg['blocks']):
+                self.block_gates[i].acquire()
+                held.append(self.block_gates[i])
+            cfg, B = self.model.cfg, self.model.cfg['blocks']
+            with self.lock:
+                wt = self.block_weights()
+                delta = {k: sum(v['sum'][k] * (wt[i] / sum(wt) / v['n']) for i, v in bank.items()) for k in self.model.shared.state_dict()}
+                sh = {k: v.clone() for k, v in self.model.shared.state_dict().items()}
+                blocks = {i: {k: v.clone() for k, v in self.model.blocks[i].state_dict().items()} for i in {B - 1, random.randrange(B)}}
+                tol, slack = (0.0, 0.0) if self.gate_strict else (self.gate_tol, 0.003)
+            m = round_measure(cfg, self.model.sigmas, self.gate_x, sh, blocks, delta)
+            ok = all(math.isfinite(a) and a <= z * (1 + tol) + slack for z, a in m.values())
+            with self.lock, torch.no_grad():
+                if ok:
+                    for k, p in self.model.shared.state_dict().items():
+                        p.add_(delta[k].to(p.dtype))
+                    self.meta['shared_rounds'] = self.meta.get('shared_rounds', 0) + 1
+                else:
+                    self.meta['gate']['rounds_refused'] = self.meta['gate'].get('rounds_refused', 0) + 1
+            self.log(ev='shared_round', ok=ok, deltas=sum(v['n'] for v in bank.values()), held_out={str(b): [round(z, 5), round(a, 5)] for b, (z, a) in m.items()})
+        except Exception as e:
+            print(f'[coord] shared round failed: {e!r}', flush=True)
+        finally:
+            for g in held:
+                g.release()
+            self.round_busy = False
 
     def _check(self, up, L):
         # Validate every field used after merging before touching parameters or counters.
         losses = up.get('losses')
         sec = up.get('seconds')
         if not isinstance(losses, list) or len(losses) != L['steps']:
-            return 'losses: expected one finite loss for every completed lease step'
-        expected_tokens = int(L['steps'] * L['batch'] * self.model.cfg['ctx'])
-        if 'tokens' in up and (type(up['tokens']) is not int or up['tokens'] != expected_tokens):
-            return 'tokens: count differs from the completed lease'
+            return 'losses: expected one for each step of the job'
+        if 'tokens' in up and (type(up['tokens']) is not int or up['tokens'] != L['steps'] * L['batch'] * self.model.cfg['ctx']):
+            return 'tokens: expected steps x batch x context for this job'
         if any(type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 1e6 for v in losses):
             return 'losses: expected finite numbers between zero and 1e6'
         if type(sec) not in (int, float) or not math.isfinite(sec) or not 0 < sec <= 86400:
@@ -1408,7 +1517,7 @@ class Coordinator:
         if any(not isinstance(up.get(k, ''), str) for k in ('host', 'device', 'name')):
             return 'worker metadata: expected strings'
         lim = 3.5 * self.lr * L['steps'] + 1e-6
-        b, changed = L['block'], False
+        b = L['block']
         for name, ref, d in (('block', self.model.blocks[b].state_dict(), up.get('d_block')),
                              ('shared', self.model.shared.state_dict(), up.get('d_shared'))):
             if not isinstance(d, dict) or set(d) != set(ref):
@@ -1421,72 +1530,88 @@ class Coordinator:
                 m = float(t.abs().max()) if t.numel() else 0.0
                 if m > lim:
                     return f'{name}.{k}: max|delta| {m:.3g} > {lim:.3g}'
-                changed = changed or m > 0.0
-                if t.numel() >= 16:
-                    flat = t.abs().reshape(-1)
-                    saturated = float((flat >= 0.95 * lim).float().mean())
-                    rms = float(flat.square().mean().sqrt()) / max(lim, 1e-12)
-                    if saturated > 0.05 or rms > 0.85:
-                        return f'{name}.{k}: coordinated delta saturation (would make held-out quality worse)'
-        if not changed:
-            return 'empty update: no model parameter changed'
         return None
 
     def gate_update(self, worker, owner, up):
-        """The test that stands in for asking anyone's permission: measure an update on held-out text nobody is given, at
-        the weight it would merge with, before it touches the model.  Returns None to go on, or the refusal to send."""
+        with self.gate_slots:
+            return self._gate_update(worker, owner, up)
+
+    def _gate_update(self, worker, owner, up):
+        """The test that stands in for asking anyone's permission, the same for every computer.  An update must lower the
+        loss on text from its own lease, which noise or an empty upload cannot do, and must not hurt held-out text nobody is
+        given, at the weight it would merge with.  Returns None to go on, a dict if it passed, or the refusal to send."""
+        t0 = time.time()
         with self.lock:
             self.expire()
             lease = up.get('lease')
             L = self.leases.get(lease) if isinstance(lease, str) else None
             if L is None or L['block'] != up.get('block') or L['worker'] != worker or self._check(up, L):
                 return None                             # update() reports these
-            b, w_block, w_shared = L['block'], 1.0 / L['same'], 1.0 / self.model.cfg['blocks']
-            o = random.choice([i for i in range(self.model.cfg['blocks']) if i != b] or [b])
+            wt = self.block_weights()
+            same = L['same']
+            b, w_block, w_shared = L['block'], 1.0 / same, wt[L['block']] / sum(wt)     # the most its shared part can count for in a round
+            others = [i for i in range(self.model.cfg['blocks']) if i != b]
+            o = random.choice(others) if others and random.random() < 0.25 else None    # the effect on other blocks, one time in four
             sh = {k: v.clone() for k, v in self.model.shared.state_dict().items()}
             bs = {k: v.clone() for k, v in self.model.blocks[b].state_dict().items()}
-            xs = {k: v.clone() for k, v in self.model.blocks[o].state_dict().items()}
-        trained = L.get('validation_data')
-        if trained is None:
-            return 409, dict(ok=False, error='lease predates learning validation; request fresh work')
-        # Only this block merges now; banked shared deltas are tested again at their actual round commit.
-        zero_shared = {k: torch.zeros_like(v) for k, v in up['d_shared'].items()}
-        trained = L.get('validation_data')
-        if trained is None:
-            return 409, dict(ok=False, error='lease predates learning validation; request fresh work')
-        learned_before, learned_after = gate_learning_measure(self.model.cfg, self.model.sigmas, trained.clone(), b, sh, bs,
-                                                              zero_shared, up['d_block'], w_shared, w_block)
-        margin = self.learn_margin * min(w_shared, w_block)
-        learned = math.isfinite(learned_after) and learned_after < learned_before * (1.0 - margin)
-        # Only this block merges now; banked shared deltas are tested again at their actual round commit.
-        before, after, o_before, o_after = gate_measure(self.model.cfg, self.model.sigmas, self.gate_x, b, o, sh, bs, xs,
-                                                        zero_shared, up['d_block'], w_shared, w_block)
-        tol, slack = (0.0, 0.0) if self.gate_strict else (self.gate_tol, 0.01)   # strict: held-out quality slipped, so only improvements
-        worse = after > before * (1 + tol) + slack
-        o_worse = o_after > o_before * (1 + tol) + slack
-        drift = self.enrol.note_drift(owner, (after - before) / max(before, 0.1)) if self.is_open(owner) else 0.0
-        ok = learned and math.isfinite(after) and math.isfinite(o_after) and not worse and not o_worse and drift <= 0.3
-        self.log(ev='gate', lease=lease, worker=worker, block=b, other=o, before=round(before, 5), after=round(after, 5), other_before=round(o_before, 5),
-                 other_after=round(o_after, 5), w_block=round(w_block, 3), w_shared=round(w_shared, 3),
-                 learned_before=round(learned_before, 5), learned_after=round(learned_after, 5), learned=learned,
-                 learning_margin=margin, fresh=bool(up.get('fresh_optimizer')), ok=ok)
+            xs = {k: v.clone() for k, v in self.model.blocks[o].state_dict().items()} if o is not None else None
+        m = gate_measure(self.model.cfg, self.model.sigmas, self.gate_x, b, o, sh, bs, xs, up['d_shared'], up['d_block'],
+                         w_shared, w_block, L['check'], self.learn_margin)
+        why = None
+        before, after = m['before'], m['after']
+        if before is None:
+            why = f"the change on its training text did not meet the required learning margin ({m['trained_before']:.4f} -> {m['trained_after']:.4f})"
+        elif not math.isfinite(after) or not math.isfinite(m['shared_after']) or (o is not None and not math.isfinite(m['other_after'])):
+            why = 'the result is not a number'
+        else:
+            tol, slack = (0.0, 0.0) if self.gate_strict else (self.gate_tol, 0.003)     # strict: held-out quality slipped, so only improvements
+            rel = (after - before) / max(before, 0.1)
+            with self.lock:
+                best_all = self.meta.setdefault('gate_best', {})
+                best = best_all[str(b)] = min(best_all.get(str(b), before), before)
+                drift = self.gate_drift[owner] = 0.8 * self.gate_drift.get(owner, 0.0) + rel
+            self.gate_recent.append(rel)
+            if after > before * (1 + tol) + slack:
+                why = f'it made held-out text worse on block {b} ({before:.4f} -> {after:.4f})'
+            elif m['shared_after'] > before * (1 + self.gate_tol) + 0.003:      # strict or not: the round gets its own test
+                why = f"its shared part made held-out text worse on block {b} ({before:.4f} -> {m['shared_after']:.4f})"
+            elif o is not None and m['other_after'] > m['other_before'] * (1 + self.gate_tol) + 0.003:
+                why = f"it made held-out text worse on block {o} ({m['other_before']:.4f} -> {m['other_after']:.4f})"
+            elif after > before and after > best * 1.05 + slack:    # no number of small steps can take a block far from its best
+                why = f'block {b} is already well above its best ({best:.4f}), so only improvements go in ({before:.4f} -> {after:.4f})'
+            elif drift > 0.08:
+                why = f'recent updates from this participant keep making held-out text worse ({drift:+.3f})'
+        ok = why is None
+        self.log(ev='gate', lease=lease, worker=worker, block=b, other=o, why=why, ms=round((time.time() - t0) * 1000), w_block=round(w_block, 3),
+                 w_shared=round(w_shared, 3), fresh=bool(up.get('fresh_optimizer')), ok=ok, **{k: None if v is None else round(v, 5) for k, v in m.items()})
         with self.lock:
             self.meta['gate']['passed' if ok else 'refused'] += 1
             if not ok and self.leases.pop(lease, None) is not None:
                 self.meta['rejected'] += 1
-        if not ok and self.is_open(owner):
-            self.enrol.strike(owner)
+                w = self.meta['workers'].setdefault(worker, dict(updates=0, tokens=0, seconds=0.0))
+                w['refused'] = w.get('refused', 0) + 1
+        if not ok and self.is_open(owner) and not self.gate_strict:     # in strict mode the refusal says more about the network than the worker
+            near_miss = before is None and m['trained_after'] <= m['trained_before'] * 1.05     # common on a block with little left to learn
+            if not (before is None and m['trained_after'] < m['trained_before']):               # it did learn, just not enough to count
+                self.enrol.strike(owner, 0.5 if near_miss else 1)
         if ok:
-            return {'tested': True}
-        if not learned:
-            return 422, dict(ok=False, error=f'update did not improve its lease training sample ({learned_before:.4f} -> {learned_after:.4f}); not merged')
-        return 422, dict(ok=False, error=f'update made held-out loss worse (block {b}: {before:.4f} -> {after:.4f}, block {o}: {o_before:.4f} -> {o_after:.4f}, running {drift:+.3f}); not merged')
+            return {'tested': True, 'same': same}
+        return 422, dict(ok=False, error=f'not merged: {why}')
 
     def update(self, worker, up):
+        b = up.get('block')
+        if type(b) is not int or not 0 <= b < self.model.cfg['blocks']:
+            return self._update(worker, up)             # which reports it
+        with self.block_gates[b]:                       # a block's next update is tested once the last is in, so each is tested on what it merges into
+            return self._update(worker, up)
+
+    def _update(self, worker, up):
         owner = worker.split('/', 1)[0]
-        checked = self.gate_update(worker, owner, up)
-        if isinstance(checked, tuple):
-            return checked
+        checked = None
+        if self.gate_all or self.is_open(owner):
+            checked = self.gate_update(worker, owner, up)
+            if isinstance(checked, tuple):
+                return checked
         with self.lock:
             self.expire()
             if not isinstance(up.get('lease'), str) or type(up.get('block')) is not int:
@@ -1503,7 +1628,7 @@ class Coordinator:
             b = L['block']
             with torch.no_grad():
                 for k, p in self.model.blocks[b].state_dict().items():
-                    p.add_(up['d_block'][k].to(p.dtype), alpha=1.0 / L['same'])
+                    p.add_(up['d_block'][k].to(p.dtype), alpha=1.0 / (checked['same'] if checked else L['same']))    # the weight it was tested at
                 self._bank_shared(b, up['d_shared'])
             m = self.meta
             toks = int(L['steps'] * L['batch'] * self.model.cfg['ctx'])
@@ -1519,7 +1644,7 @@ class Coordinator:
             wall = time.time() - L['t0']
             w = m['workers'].setdefault(worker, dict(updates=0, tokens=0, seconds=0.0))
             w.update(updates=w['updates'] + 1, tokens=w['tokens'] + toks, seconds=round(w['seconds'] + sec, 1), last=now(),
-                     last_block=b, device=str(up.get('device', ''))[:32],
+                     last_block=b, device=str(up.get('device', ''))[:32], measured_bytes_s=round(toks / max(wall, 1e-6), 1),
                      tok_s=round(toks / max(sec, 1e-6), 1), steps=L['steps'],
                      wall_s=round(wall if not w.get('wall_s') else 0.7 * w['wall_s'] + 0.3 * wall, 1))
             w.pop('host', None)                         # do not retain legacy machine hostnames
@@ -1547,17 +1672,17 @@ class Coordinator:
             threading.Thread(target=self.run_eval, daemon=True).start()
         return 200, dict(ok=True, updates=n)
 
+    def generation_choice(self):
+        """The route whose writing measured closest to real text; the top block until there is a measurement."""
+        with self.lock:
+            ev = self.meta['evals'][-1] if self.meta['evals'] else {}
+            return dict(mode=ev.get('serve_mode', 'top'), temp=ev.get('serve_temp', 0.75))
+
     def copy_model(self):
         with self.lock:
             m = Model(self.model.cfg)
             m.load_state_dict(self.model.state_dict())
         return m.eval()
-
-    def generation_choice(self):
-        """Serve the sampler that measured best on real held-out text; default conservatively while unevaluated."""
-        with self.lock:
-            ev = self.meta['evals'][-1] if self.meta['evals'] else {}
-            return dict(mode=ev.get('serve_mode', 'top'), temp=ev.get('serve_temp', 0.7))
 
     def run_eval(self):
         try:
@@ -1566,10 +1691,12 @@ class Coordinator:
             m, t0 = self.copy_model(), time.time()
             ev = dict(updates=n0, tokens=self.meta['tokens'], t=now(), **evaluate(m, self.heldout))
             ev.update(evaluate_chain(m, self.heldout))
-            ev.update(evaluate_generation(m, self.heldout, self.teacher))
-            ev['serve_mode'] = 'chain' if ev['chain_gen_bits'] <= ev['top_gen_bits'] else 'top'
-            ev['serve_temp'] = 0.0 if ev['serve_mode'] == 'chain' else 0.7
-            ev['sample'] = generate(m, 'The ', n=100, temp=0.0, mode='chain', ctx_len=128)
+            if self.teacher:
+                ev.update(evaluate_generation(m, self.heldout, self.teacher))
+                close = lambda k: abs(ev[k] - ev['real_bits'])
+                ev['serve_mode'] = 'chain' if close('chain_gen_bits') <= close('top_gen_bits') else 'top'
+                ev['serve_temp'] = 0.0 if ev['serve_mode'] == 'chain' else 0.75
+            ev['sample'] = generate(m, 'The ', n=100, temp=ev.get('serve_temp', 0.0), mode=ev.get('serve_mode', 'chain'), ctx_len=128)
             ev['eval_seconds'] = round(time.time() - t0, 1)
             with self.lock:
                 self.meta['evals'] = (self.meta['evals'] + [ev])[-100:]
@@ -1581,16 +1708,79 @@ class Coordinator:
         finally:
             self.eval_busy = False
 
+    def recent_training_rate(self):
+        """Accepted byte-target presentations per wall second, from this process's event log.
+
+        Bounded metadata read only; no worker IDs or event bodies leave this method.
+        A restart starts a new measurement window, never splices a counter reset.
+        """
+        import datetime as _dt
+        import stat as _stat
+        end = time.time()
+        cached = getattr(self, '_rate_cache', None)
+        if cached and 0 <= end - cached[0] < 2:
+            return dict(cached[1])
+        start = max(self.rate_started_at, end - 60.0)
+        span = end - start
+        out = dict(state='warming_up', bytes_per_s=None, window_s=round(max(0, span), 2),
+                   accepted_byte_targets=None, accepted_updates=None,
+                   window_end_utc=_dt.datetime.fromtimestamp(end, _dt.timezone.utc).isoformat(),
+                   source='coordinator_accepted_update_log', process_started_at=self.rate_started_at,
+                   units='byte-target presentations per wall second')
+        if span < 30:
+            return out
+        try:
+            fd = os.open(self.log_path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+            with os.fdopen(fd, 'rb') as stream:
+                info = os.fstat(stream.fileno())
+                if not _stat.S_ISREG(info.st_mode):
+                    raise ValueError('not_regular')
+                offset = max(0, info.st_size - 262144)
+                stream.seek(offset)
+                body = stream.read(262144)
+            lines = body.splitlines()
+            if offset:
+                lines = lines[1:]
+            earliest, total, updates, malformed = None, 0, 0, False
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                    epoch = _dt.datetime.fromisoformat(event['t'].replace('Z', '+00:00')).timestamp()
+                    earliest = epoch if earliest is None else min(earliest, epoch)
+                    if start < epoch <= end and event.get('ev') == 'update':
+                        value = event.get('tokens')
+                        if type(value) is not int or value < 0:
+                            raise ValueError('bad_counter')
+                        total += value
+                        updates += 1
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    malformed = True
+            if malformed or (offset and (earliest is None or earliest > start)):
+                out['state'] = 'history_incomplete'
+            else:
+                out.update(state='measured', bytes_per_s=round(total / span, 2),
+                           accepted_byte_targets=total, accepted_updates=updates)
+        except (OSError, ValueError):
+            out['state'] = 'history_unavailable'
+        self._rate_cache = (end, dict(out))
+        return out
+
     def public_status(self):
         # Private identities remain in checkpoints; public metrics use stable pseudonyms.
         with self.lock:
             result = json.loads(json.dumps(self.status()))
-            gate = dict(self.meta['gate'], strict=self.gate_strict, shared_rounds=self.meta.get('shared_rounds', 0))
+            recent = list(self.gate_recent)
+            gate = dict(self.meta['gate'], strict=self.gate_strict, shared_rounds=self.meta.get('shared_rounds', 0), recent_tested=len(recent),
+                        recent_improved=round(sum(r < 0 for r in recent) / len(recent), 4) if recent else None,
+                        recent_avg_change=round(sum(recent) / len(recent), 5) if recent else None)
         result['workers'] = {self.alias(name): {k: v for k, v in stats.items() if k != 'host'}
                              for name, stats in result['workers'].items()}
         for lease in result['active_leases']:
             lease['worker'] = self.alias(lease['worker'])
         result['gate'] = gate
+        with self.lock:
+            result['left_workers'] = [a for a in self.meta.get('left_workers', []) if a not in result['workers']]
+        result['training_throughput'] = self.recent_training_rate()
         result['net_inference'] = self.net.status()
         result['generation'] = self.generation_choice()
         result['open_join'] = dict(open=True, **self.enrol.stats()) if self.enrol else dict(open=False)
@@ -1605,8 +1795,7 @@ class Coordinator:
                         rejected=m['rejected'], block_updates=m['block_updates'], block_ce=m['block_ce'],
                         active_leases=[dict(block=v['block'], worker=v['worker'], age_s=round(time.time() - v['t0']))
                                        for v in self.leases.values()],
-                        workers={name: {k: v for k, v in w.items() if k not in ('host', 'ip')} for name, w in m['workers'].items()},
-                        last_eval=(m['evals'][-1] if m['evals'] else None),
+                        workers={k: {f: v for f, v in w.items() if f not in ('host', 'ip')} for k, w in m['workers'].items()}, last_eval=(m['evals'][-1] if m['evals'] else None),
                         eval_history=[dict(updates=e['updates'], t=e.get('t'), ar_bpb=e['ar_bits_per_byte'], chain_gen_bits=e.get('chain_gen_bits'),
                                            top_gen_bits=e.get('top_gen_bits'), real_bits=e.get('real_bits')) for e in m['evals']],
                         data=dict(source=m.get('data_source'), docs=self.data.docs, buffered_mb=round(len(self.data.buf) / 2**20, 1),
@@ -1625,7 +1814,7 @@ def serve(a):
 
         def setup(self):
             super().setup()
-            self.connection.settimeout(600)
+            self.connection.settimeout(60)
 
         def _reject(self, code, message):
             # Do not reuse connections with unread or invalid request bodies.
@@ -1674,12 +1863,10 @@ def serve(a):
 
         def _net_sample(self, q):
             prompt = q.get('prompt', 'The ')[:200]
-            choice = C.generation_choice()
-            mode = q.get('mode') or choice['mode']
-            if mode not in ('chain', 'top'):
-                return self._send(400, dict(error='mode must be chain or top'))
-            default_temp = choice['temp'] if 'mode' not in q else (0.0 if mode == 'chain' else 0.7)
-            n, temp, seed = max(1, min(160, int(q.get('n', 64)))), float(q.get('temp', default_temp)), int(q.get('seed', 0)) % (2 ** 31)
+            sampler = q.get('sampler') or q.get('mode') or 'chain'
+            if sampler not in ('chain', 'top'):
+                return self._send(400, dict(error='sampler must be chain or top'))
+            n, temp, seed = max(1, min(160, int(q.get('n', 64)))), float(q.get('temp', 0.0 if sampler == 'chain' else 0.75)), int(q.get('seed', 0)) % (2 ** 31)
             if not math.isfinite(temp):
                 return self._send(400, dict(error='temp must be finite'))
             if not C.net.gen_lock.acquire(blocking=False):
@@ -1693,7 +1880,7 @@ def serve(a):
                 self.send_header('X-Accel-Buffering', 'no')
                 self.send_header('Connection', 'close')
                 self.end_headers()
-                g = C.net.generate(prompt, n, temp=temp, seed=seed, mode=mode)
+                g = C.net.generate(prompt, n, temp=temp, seed=seed, sampler=sampler)
                 for ev in g:
                     self.wfile.write((json.dumps(ev, separators=(',', ':')) + '\n').encode())
                     self.wfile.flush()
@@ -1726,13 +1913,11 @@ def serve(a):
                         return self._send(503, dict(error='a sample is already being generated; try again shortly'))
                     try:
                         torch.set_num_threads(a.eval_threads)
-                        choice = C.generation_choice()
-                        mode = q.get('mode') or choice['mode']
-                        if mode not in ('chain', 'top'):
-                            return self._send(400, dict(error='mode must be chain or top'))
-                        default_temp = choice['temp'] if 'mode' not in q else (0.0 if mode == 'chain' else 0.7)
+                        choice, asked = C.generation_choice(), q.get('mode') or q.get('sampler')
+                        mode = asked if asked in ('chain', 'top') else choice['mode']
+                        temp = choice['temp'] if asked not in ('chain', 'top') else 0.0 if mode == 'chain' else 0.75
                         txt = generate(C.copy_model(), q.get('prompt', 'The ')[:200], n=max(1, min(240, int(q.get('n', 120)))),
-                                       temp=float(q.get('temp', default_temp)), seed=int(q.get('seed', 0)), mode=mode, ctx_len=128)
+                                       temp=float(q.get('temp', temp)), seed=int(q.get('seed', 0)), mode=mode, ctx_len=128)
                     finally:
                         C.sample_lock.release()
                     return self._send(200, txt, 'text/plain; charset=utf-8')
@@ -1742,37 +1927,31 @@ def serve(a):
                     return self._send(200, C.enrol.challenge())
                 if p == 'join.sh':
                     return self._send(200, JOIN_SH.replace('@BASE@', self._base()), 'text/x-shellscript; charset=utf-8')
+                if p == 'leave.sh':
+                    return self._send(200, LEAVE_SH.replace('@BASE@', self._base()), 'text/x-shellscript; charset=utf-8')
                 if p == 'iblock':
                     who = C.auth(self.headers)
                     if not who:
-                        return self._send(401, dict(error='missing or unknown token'))
+                        code, why = C.auth_failure(self.headers)
+                        return self._send(code, dict(error=why))
                     why = C.blocked(who)
                     if why:
                         return self._send(403, dict(error=why))
-                    if not C.lease_slots.acquire(blocking=False):
-                        return self._send(429, dict(error='block download capacity reached; retry shortly'))
-                    try:
-                        blob, why = C.net.block_blob(int(q.get('snap', 0)), int(q.get('block', -1)), who)
-                        if blob is None:
-                            return self._send(429 if why == 'slow down' else 404, dict(error=why))
-                        return self._send(200, blob, 'application/octet-stream')
-                    finally:
-                        C.lease_slots.release()
+                    blob, why = C.net.block_blob(int(q.get('snap', 0)), int(q.get('block', -1)), who)
+                    if blob is None:
+                        return self._send(429 if why == 'slow down' else 404, dict(error=why))
+                    return self._send(200, blob, 'application/octet-stream')
                 if p == 'lease':
                     who = C.auth(self.headers)
                     if not who:
-                        return self._send(401, dict(error='missing or unknown token'))
+                        code, why = C.auth_failure(self.headers)
+                        return self._send(code, dict(error=why))
                     why = C.blocked(who)
                     if why:
                         return self._send(403, dict(error=why))
-                    if not C.lease_slots.acquire(blocking=False):
-                        return self._send(429, dict(error='lease download capacity reached; retry shortly'))
-                    try:
-                        name = f"{who}/{q.get('name', 'worker')[:40]}"
-                        body = to_bytes(C.lease(name, int(q.get('steps') or 0), int(q.get('batch') or 0), q.get('session', '')[:32], owner=who, client=self._client()))
-                        return self._send(200, body, 'application/octet-stream')
-                    finally:
-                        C.lease_slots.release()
+                    name = f"{who}/{q.get('name', 'worker')[:40]}"
+                    body = to_bytes(C.lease(name, int(q.get('steps') or 0), int(q.get('batch') or 0), q.get('session', '')[:32], owner=who, client=self._client()))
+                    return self._send(200, body, 'application/octet-stream')
                 if p in ('', 'dbmoe', 'index.html'):
                     s = C.status()
                     ev = s['last_eval'] or {}
@@ -1799,7 +1978,12 @@ def serve(a):
                 # Authenticate and validate framing before accepting an upload.
                 who = C.auth(self.headers)
                 if not who:
-                    return self._reject(401, 'missing or unknown token')
+                    return self._reject(*C.auth_failure(self.headers))
+                if p == 'leave':
+                    name = self._read_small_json().get('name')
+                    if name is not None and not isinstance(name, str):
+                        return self._reject(400, 'invalid worker name')
+                    return self._send(200, C.leave(who, self.headers, name[:40] if name else None))
                 why = C.blocked(who)
                 if why:
                     return self._reject(403, why)
@@ -1851,7 +2035,7 @@ def serve(a):
             finally:
                 if slot:
                     C.upload_slots.release()
-                self.connection.settimeout(600)
+                self.connection.settimeout(60)
 
     srv = ThreadingHTTPServer((a.host, a.port), H)
     srv.daemon_threads = True
@@ -1879,6 +2063,35 @@ def http(method, url, token, body=None, timeout=900):
         return r.read()
 
 
+def portable_expert_counts(top_i, experts):
+    """Fixed-size expert histogram without bincount, which some MPS builds lack."""
+    return (top_i[:, None] == torch.arange(experts, device=top_i.device)[None, :]).sum(0)
+
+
+def cpu_model_name():
+    try:
+        with open('/proc/cpuinfo') as f:
+            for line in f:
+                if line.lower().startswith('model name'):
+                    return line.split(':', 1)[1].strip()
+    except OSError:
+        pass
+    if platform.system() == 'Darwin':
+        try:
+            import subprocess
+            return subprocess.check_output(['sysctl', '-n', 'machdep.cpu.brand_string'], timeout=5, text=True).strip()
+        except Exception:
+            pass
+    return platform.processor()
+
+
+def ram_gib():
+    try:
+        return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / 2 ** 30
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
 def normalize_hardware(value):
     """Allowlist optional public, self-reported specs. Never forward arbitrary client metadata."""
     if not isinstance(value, dict) or type(value.get('schema')) is not int or value['schema'] != 1:
@@ -1888,13 +2101,19 @@ def normalize_hardware(value):
     if not isinstance(value.get('backend'), str) or value['backend'] not in ('cpu', 'cuda', 'rocm', 'xpu', 'mps'):
         return None
     out = dict(schema=1, self_reported=True, backend=value['backend'])
-    for key in ('cpu_arch', 'torch_version', 'runtime_version', 'gpu_name'):
+    for key in ('cpu_model', 'os', 'cpu_arch', 'torch_version', 'runtime_version', 'gpu_name'):
         text = value.get(key)
         if isinstance(text, str):
             out[key] = ''.join(c for c in text if c.isprintable()).strip()[:80]
     threads = value.get('cpu_threads')
     if type(threads) is int and 1 <= threads <= 4096:
         out['cpu_threads'] = threads
+    cores = value.get('cpu_cores')
+    if type(cores) is int and 1 <= cores <= 4096:
+        out['cpu_cores'] = cores
+    ram = value.get('ram_gib')
+    if type(ram) in (int, float) and 0 < ram <= 1048576:
+        out['ram_gib'] = round(float(ram), 1)
     memory = value.get('gpu_memory_gib')
     if type(memory) in (int, float) and 0 < memory <= 65536:
         out['gpu_memory_gib'] = round(float(memory), 1)
@@ -1907,7 +2126,8 @@ def normalize_hardware(value):
 def worker_hardware(device_info, threads):
     """Called only after --share-hardware opt-in. No hostnames, IPs, serials or filesystem paths."""
     backend = device_info['backend']
-    report = dict(schema=1, self_reported=True, backend=backend, cpu_arch=platform.machine(),
+    report = dict(schema=1, self_reported=True, backend=backend, cpu_arch=platform.machine(), cpu_model=cpu_model_name(),
+                  os=platform.system(), cpu_cores=os.cpu_count() or 1, ram_gib=ram_gib(),
                   cpu_threads=max(1, threads), torch_version=str(torch.__version__),
                   runtime_version=str(torch.version.hip if backend == 'rocm' else
                                       torch.version.cuda if backend == 'cuda' else
@@ -2215,6 +2435,54 @@ def enrol_cmd(a):
     print(f'[enrol] start with: python3 dbmoe.py worker --url {base} --token @{path}', flush=True)
 
 
+def leave_cmd(a):
+    """Leave for good: your workers come off the public list and your credential stops working.  What you already
+    contributed stays in the model, because it cannot be separated out.  You can rejoin at any time."""
+    base, path = a.url.rstrip('/'), None
+    if a.token:
+        token = open(os.path.expanduser(a.token[1:])).read().strip() if a.token.startswith('@') else a.token
+    else:
+        path = token_path(base)
+        if not os.path.exists(path):
+            sys.exit(f'[leave] no saved credential at {path}; if you minted your own, use --token @worker.token')
+        with open(path) as f:
+            token = f.read().strip()
+    try:
+        r = json.loads(http('POST', f'{base}/leave', token, json.dumps(dict(name=a.name) if a.name else {}).encode(), timeout=60))
+    except urllib.error.HTTPError as e:
+        if e.code != 410:
+            sys.exit(f"[leave] HTTP {e.code}: {e.read()[:300].decode('utf-8', 'replace')}")
+        r = dict(removed=0, credential_ended=True)
+    if path and not a.name:
+        os.remove(path)
+        try:
+            os.remove(os.path.join(os.path.dirname(path), 'worker-name'))
+        except OSError:
+            pass
+    print(f"[leave] {r['removed']} worker record(s) removed from the public list" + ('; credential ended' if r['credential_ended'] else ''), flush=True)
+    print('[leave] Any worker still running with this credential stops by itself. Your updates so far stay in the model.', flush=True)
+
+
+def stable_worker_name():
+    """A random label kept on this machine, so a restart keeps the same card on the list.  Never the hostname."""
+    path = os.path.join(os.path.expanduser('~'), '.dbmoe', 'worker-name')
+    try:
+        with open(path) as f:
+            name = f.read().strip()
+        if name:
+            return name[:40]
+    except OSError:
+        pass
+    name = 'worker-' + secrets.token_hex(3)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(name)
+    except OSError:
+        pass
+    return name
+
+
 def load_or_join(base, force=False):
     """Our own credential: the saved one, or a new one.  No person is involved."""
     path = token_path(base)
@@ -2306,6 +2574,8 @@ def serve_hops(a, base):
                 time.sleep(min(600.0, float(r['retry_s'])))
         except urllib.error.HTTPError as e:
             result = None
+            if e.code == 410:
+                return
             print(f'[serve] HTTP {e.code}; retry shortly', flush=True)
             time.sleep(300 if e.code in (401, 403, 404) else backoff)
             backoff = min(60, backoff * 2)
@@ -2314,6 +2584,21 @@ def serve_hops(a, base):
             print(f'[serve] error {e!r}; retry in {backoff}s', flush=True)
             time.sleep(backoff)
             backoff = min(60, backoff * 2)
+
+
+def post_update(base, token, body, tries=4):
+    """Training work is worth a few retries: a busy coordinator or a dropped connection should not throw it away.  A
+    lease merges at most once, so a retry after a lost reply gets a clean refusal rather than merging twice."""
+    for attempt in range(tries):
+        try:
+            return json.loads(http('POST', f'{base}/update', token, body))
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 502, 503, 504) or attempt == tries - 1:
+                raise
+        except (urllib.error.URLError, OSError):
+            if attempt == tries - 1:
+                raise
+        time.sleep(5 * 2 ** attempt + random.random() * 5)
 
 
 def train_lease(L, device, opt_cache=None):
@@ -2359,7 +2644,7 @@ def train_lease(L, device, opt_cache=None):
     if opt_cache is not None:
         opt_cache.pop(b, None)
         opt_cache[b] = (opt.state_dict(), L.get('block_version', 0) + 1)
-        while len(opt_cache) > 1:                          # sticky block: one optimizer state is enough and saves RAM
+        while len(opt_cache) > 2:                          # keep the two most recent blocks
             opt_cache.pop(next(iter(opt_cache)))
     # Keep the reported 10ms resolution positive for tiny/fast leases; zero is invalid wire metadata.
     return dict(lease=L['lease'], block=b, losses=ces, seconds=max(0.01, round(sec, 2)), tokens=int(S * bs * cfg['ctx']),
@@ -2374,24 +2659,28 @@ def worker(a):
         torch.set_num_interop_threads(1)
     except RuntimeError:
         pass
-    # Prove the requested device works before reading a credential or contacting the coordinator.
     try:
         device_info = prepare_worker_device(a.device, xpu_memory_fraction=getattr(a, 'xpu_memory_fraction', None))
     except (ValueError, RuntimeError) as e:
-        sys.exit(f'[worker] {e}')
+        sys.exit(f'[worker] {e}')                       # before any network or credential, so a bad device costs nothing
     device = device_info['torch_device']
-    base = getattr(a, 'url', DEFAULT_URL).rstrip('/')
-    token_arg = getattr(a, 'token', None)
-    auto = not token_arg
+    base = a.url.rstrip('/')
+    auto = not a.token
     if auto:                                            # nobody to ask: use or get our own credential
         a.token = load_or_join(base)
-    elif token_arg.startswith('@'):                     # --token @FILE keeps the token out of `ps` output
-        a.token = open(os.path.expanduser(token_arg[1:])).read().strip()
-    else:
-        a.token = token_arg
-    a.name = getattr(a, 'name', '') or ('worker-' + secrets.token_hex(3))
-    hardware = worker_hardware(device_info, a.threads) if getattr(a, 'share_hardware', False) else None
+    elif a.token.startswith('@'):                       # --token @FILE keeps the token out of `ps` output
+        a.token = open(os.path.expanduser(a.token[1:])).read().strip()
+    a.name = a.name or stable_worker_name()
+    hardware = None
+    if not getattr(a, 'no_share_hardware', False):
+        try:
+            hardware = worker_hardware(device_info, a.threads)
+        except Exception:       # a report is never worth stopping for
+            pass
     print(f'[worker] {VERSION} {a.name} -> {base}  device={device} threads={a.threads}', flush=True)
+    if hardware:
+        print('[worker] shown on the public worker list: ' + ', '.join(f'{k}={v}' for k, v in hardware.items() if k not in ('schema', 'self_reported'))
+              + '.  No hostname or address.  --no-share-hardware turns this off.', flush=True)
     if 'xpu_memory_fraction' in device_info:
         print(f'[worker] XPU allocator cap {device_info["xpu_allocator_limit_gib"]:.3f} GiB '
               '(not reserved; host RAM and runtime overhead are outside this cap)', flush=True)
@@ -2413,7 +2702,7 @@ def worker(a):
                 up['hardware'] = hardware
             body = to_bytes(up)
             t2 = time.time()
-            r = json.loads(http('POST', f'{base}/update', a.token, body))
+            r = post_update(base, a.token, body)
             tail = up['losses'][-5:]
             print(f"[worker] block {L['block']}{' (fresh Adam)' if up['fresh_optimizer'] else ''}  ce {up['losses'][0]:.3f} -> {sum(tail) / len(tail):.3f}  "
                   f"{up['tokens'] / max(up['seconds'], 1e-6):.0f} bytes/s  train {up['seconds']:.0f}s  "
@@ -2422,6 +2711,9 @@ def worker(a):
             if a.once and done >= a.once:
                 return
         except urllib.error.HTTPError as e:
+            if e.code == 410:
+                print('[worker] this credential has left the run; stopping', flush=True)
+                return
             print(f'[worker] HTTP {e.code} {e.read()[:300]!r}; retry in {backoff}s', flush=True)
             if e.code == 401 and auto:                  # the coordinator no longer knows this credential: get a new one
                 try:
@@ -2482,19 +2774,24 @@ def main():
     c.add_argument('--join-per-client-day', type=int, default=0, help='0: no artificial daily participant limit; capacity backpressure remains')
     c.add_argument('--join-per-day', type=int, default=0, help='0: no artificial daily participant limit')
     c.add_argument('--gate-windows', type=int, default=12)
-    c.add_argument('--gate-tol', type=float, default=0.10, help='refuse an update that makes held-out loss this fraction worse')
-    c.add_argument('--gate-all', action='store_true', default=True, help='compatibility option: every participant update is always tested')
-    c.add_argument('--learn-margin', type=float, default=0.0, help='relative lease-sample learning margin before merge-weight dilution')
+    c.add_argument('--gate-tol', type=float, default=0.03, help='refuse an update that makes held-out loss this fraction worse')
+    c.add_argument('--no-gate-all', dest='gate_all', action='store_false', help='test only open participants, not tokens.json ones')
+    c.add_argument('--min-steps', type=int, default=10, help='shortest lease; shorter ones change too little to test')
+    c.add_argument('--learn-margin', type=float, default=0.002, help='how much an update must lower the loss on text from its own lease (fraction)')
     c.add_argument('--net-refresh', type=float, default=600, help='seconds between inference snapshots')
     t = sp.add_parser('enrol', aliases=['token'], help='optional: mint your own token now and save it privately (the worker also does this by itself)')
     t.add_argument('--url', default=DEFAULT_URL)
     t.add_argument('--token-file', default='worker.token')
+    l = sp.add_parser('leave', help='leave for good: take your workers off the public list and end your credential')
+    l.add_argument('--url', default=DEFAULT_URL)
+    l.add_argument('--token', default=None, help='bearer token or @FILE, if not the saved one')
+    l.add_argument('--name', default=None, help='remove only this worker label and keep your credential')
     w = sp.add_parser('worker')
     w.add_argument('--url', default=DEFAULT_URL)
     w.add_argument('--token', default=None, help='optional bearer token or @FILE; without one the worker enrols itself')
-    w.add_argument('--name', default='worker-' + secrets.token_hex(3), help='public pseudonym (default: random worker label, never the hostname)')
-    w.add_argument('--share-hardware', action='store_true', help='opt in to public self-reported GPU model/memory, '
-                   'CPU architecture/worker threads, and PyTorch/runtime versions; no hostname or IP')
+    w.add_argument('--name', default='', help='label for this worker (default: worker, or the hostname with --token)')
+    w.add_argument('--no-share-hardware', action='store_true', help='keep CPU/GPU model, RAM, thread count and PyTorch version off the public list')
+    w.add_argument('--share-hardware', action='store_true', help=argparse.SUPPRESS)    # the default now; accepted for older commands
     w.add_argument('--no-serve', action='store_true', help='train only: do not serve a block for network inference')
     w.add_argument('--serve-only', action='store_true', help='serve network inference only: no training')
     w.add_argument('--device', default='cpu', help='cpu (default), auto, cuda[:N], rocm[:N] for AMD, xpu[:N] for Intel, or mps for Mac; '
@@ -2529,7 +2826,9 @@ def main():
         else:
             s.add_argument('--heldout', required=True)
     a = p.parse_args()
-    {'coord': serve, 'enrol': enrol_cmd, 'token': enrol_cmd, 'worker': worker, 'sample': sample_cmd, 'eval': eval_cmd,
+    if a.cmd == 'worker' and not a.name:
+        a.name = stable_worker_name()
+    {'coord': serve, 'enrol': enrol_cmd, 'token': enrol_cmd, 'leave': leave_cmd, 'worker': worker, 'sample': sample_cmd, 'eval': eval_cmd,
      'check-device': check_device_cmd, 'hardware-report': hardware_report_cmd}[a.cmd](a)
 
 

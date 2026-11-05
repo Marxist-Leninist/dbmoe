@@ -116,7 +116,7 @@ class AppleDeviceTests(unittest.TestCase):
                 sent.append(dbmoe.from_bytes(body))
                 return b'{"ok":true}'
             args = argparse.Namespace(threads=1, device='mps', url='https://example.invalid', token='test-only',
-                                      name='test', hours=0, steps=2, batch=1, once=1, share_hardware=opt_in)
+                                      name='test', hours=0, steps=2, batch=1, once=1, no_share_hardware=not opt_in)
             info = dict(torch_device='mps', device='mps', backend='mps', gpu_name='Metal (MPS)')
             with mock.patch.object(dbmoe, 'prepare_worker_device', return_value=info), \
                  mock.patch.object(dbmoe, 'train_lease', return_value=update) as train, \

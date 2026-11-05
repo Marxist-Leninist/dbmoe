@@ -30,7 +30,7 @@ class LoopbackIntegrationTest(unittest.TestCase):
                     '--host', '127.0.0.1', '--port', str(port), '--tokens', str(root / 'tokens.json'),
                     '--text-file', str(root / 'training.txt'), '--cfg', json.dumps(cfg), '--steps', '2',
                     '--batch', '1', '--heldout', '2', '--eval-every', '0', '--snap-every', '0',
-                    '--eval-threads', '1'], stdout=log, stderr=subprocess.STDOUT)
+                    '--eval-threads', '1', '--no-gate-all', '--min-steps', '1'], stdout=log, stderr=subprocess.STDOUT)
                 try:
                     deadline = time.monotonic() + 20
                     while True:
@@ -46,9 +46,9 @@ class LoopbackIntegrationTest(unittest.TestCase):
                     for opt_in in (True, False):
                         cmd = [sys.executable, script, 'worker', '--url', url,
                                '--token', '@' + str(root / 'worker.token'), '--name', 'public-test',
-                               '--device', 'cpu', '--threads', '1', '--steps', '2', '--batch', '1', '--once', '1']
-                        if opt_in:
-                            cmd.append('--share-hardware')
+                               '--device', 'cpu', '--threads', '1', '--steps', '2', '--batch', '1', '--once', '1', '--no-serve']
+                        if not opt_in:
+                            cmd.append('--no-share-hardware')
                         worker = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
                         self.assertEqual(worker.returncode, 0, worker.stdout + worker.stderr)
                         with opener.open(url + '/status', timeout=2) as response:

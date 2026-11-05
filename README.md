@@ -20,27 +20,30 @@ python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 For CUDA, use the PyTorch installation command appropriate for your GPU and driver from https://pytorch.org/get-started/locally/.
 
-Self-service enrolment is open: no owner approval is needed. On Linux or macOS, the one-command installer downloads the current worker, enrols automatically and starts a bounded one-hour run:
+Anonymous joining is open. No account, manually supplied token, or owner approval is needed. The worker obtains and stores its own private credential automatically.
+
+On Linux or macOS, first download and review the installer. It installs the reviewed worker and CPU PyTorch if needed, then starts participating until you stop it:
 
 ```sh
-curl -fsSL https://codex.opentransformers.online/dbmoe/join.sh | sh -s -- --threads 2 --hours 1
+curl -fsSL https://codex.opentransformers.online/dbmoe/join.sh -o join.sh
+less join.sh
+sh join.sh --threads 2
 ```
 
-For manual setup, download the exact currently deployed worker into a new directory. Optionally mint your own token immediately with `enrol`; it is saved privately in `worker.token` with mode `0600` and is not printed. Alternatively, omit `--token` from the worker command and it will enrol itself.
+Or download the exact deployed worker and start it directly:
 
 ```sh
 curl -fsSL https://codex.opentransformers.online/dbmoe/code -o dbmoe.py
-# Optional: mint your own token now.
-python dbmoe.py enrol --url https://codex.opentransformers.online/dbmoe
-python dbmoe.py worker \
-  --url https://codex.opentransformers.online/dbmoe \
-  --token @worker.token --name YOUR_PUBLIC_PSEUDONYM \
-  --device cpu --threads 2 --hours 1
+python dbmoe.py worker --url https://codex.opentransformers.online/dbmoe --device cpu --threads 2
 ```
 
-New enrolment uses a short proof-of-work challenge and per-address limits; the coordinator stores only a hash of the credential. Keep the token private and request revocation if exposed. Choose a public pseudonym for your worker name, because participation statistics may be visible on the progress page. Workers use your machine's compute, electricity and network. Run only on machines you own or are authorized to use.
+Use `py` and `curl.exe` on Windows where appropriate. Install a compatible PyTorch build first. Ctrl+C stops participation. You can choose your own session budget with `--hours 1`; it is optional, not a network-imposed cutoff.
 
-Use `--device cuda` for NVIDIA or `--device rocm` for a supported AMD GPU. The default remains CPU; `--device auto` explicitly opts in to selecting an available GPU, otherwise CPU. An explicit GPU request now fails early if unavailable instead of silently training on CPU. `--hours 1` limits participation to approximately one hour, checked between leases.
+Active anonymous access renews automatically. There is no daily participant count or lifetime job limit. Work can wait when compute or validation capacity is full. After long inactivity, the worker can rejoin automatically. Credentials are private and should never be posted, committed or copied into screenshots.
+
+The worker trains and can serve an inference block. This uses your machine's compute, electricity and network; only join on machines you own or are authorized to use. Inference workers can see prompt bytes routed through their block, so do not send private prompts to a public volunteer network. `--no-serve` opts out of serving. Submitted training updates are checked before merging, but those checks do not guarantee language improvement or protection against every malicious update.
+
+**Release synchronization:** the live anonymous worker is currently served at `/dbmoe/code`. The repository's AMD/backend and opt-in hardware extensions are being merged with that newer network protocol. Do not assume an option supported by one revision is available in another; check `python dbmoe.py --help` and `python dbmoe.py worker --help`. The CPU anonymous join flow above has been tested against the live endpoint.
 
 ## AMD GPUs (ROCm)
 
@@ -57,14 +60,7 @@ python dbmoe.py check-device --device rocm
 
 Expect a nonempty HIP version, GPU availability `True`, and a successful `check-device` result. This runs a tiny synthetic DBMoE forward/backward/AdamW update and checks finite, bounded CPU deltas through safe serialization. It makes no network request, reads no token, and changes no training checkpoint. GPU workers also run this check automatically before their first lease. It does not establish full-size-model memory capacity or long-run stability.
 
-Then join normally:
-
-```sh
-python dbmoe.py worker \
-  --url https://codex.opentransformers.online/dbmoe \
-  --token @worker.token --name YOUR_PUBLIC_PSEUDONYM \
-  --device rocm --threads 2 --batch 1 --hours 1
-```
+The AMD device-check implementation is in this repository, but integration with the deployed anonymous worker is pending. Do not substitute an older token-requiring worker into the anonymous join instructions. Physical AMD training validation is still required before claiming a tested AMD release.
 
 Use `--device rocm:1` for the second visible GPU, or `--device cuda:1` on NVIDIA. Each worker uses one GPU; `--threads` controls PyTorch CPU threads. Start with batch 1 when available VRAM is uncertain. A coordinator can limit requested batch sizes, and full-size model weights plus optimizer state must still fit. Reduce the batch if training runs out of memory; a successful tiny check is not a guarantee that a live lease will fit.
 
@@ -76,7 +72,7 @@ If the check fails, confirm the installed wheel, supported GPU/OS, driver and de
 
 ## Optional public hardware specs
 
-Add `--share-hardware` to opt in to publishing self-reported hardware details with your worker statistics: GPU model and rounded total GPU memory, CPU architecture, the number of PyTorch CPU threads assigned to this worker, PyTorch version, and CUDA/ROCm runtime version. Thread count is not the machine's physical core count; GPU memory is not free memory. These reports are supplied by participants, not independently verified inventory.
+Once the hardware extension is present in the deployed worker, add `--share-hardware` to opt in to publishing self-reported hardware details with your worker statistics: GPU model and rounded total GPU memory, CPU architecture, the number of PyTorch CPU threads assigned to this worker, PyTorch version, and CUDA/ROCm runtime version. Thread count is not the machine's physical core count; GPU memory is not free memory. These reports are supplied by participants, not independently verified inventory.
 
 Without this flag, no detailed hardware report is sent. Device/backend and participation statistics are still sent as before. New workers do not transmit machine hostnames, IP fields, serial numbers or local paths in update payloads; the coordinator/network provider necessarily sees connection IPs. Choose an explicit public pseudonym, or omit `--name` for a random worker label. The coordinator strips legacy host/IP fields from public status and accepts only the documented hardware fields. Restart without the flag to withdraw the report on the next accepted update; prior logs/backups may still retain earlier reports. Older coordinators may ignore this optional metadata, and website display requires coordinator/page support.
 

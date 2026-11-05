@@ -84,7 +84,7 @@ const records=s.workers&&typeof s.workers==='object'?s.workers:{};
 const leases=Array.isArray(s.active_leases)?s.active_leases:[];
 const leaseMap=new Map();for(const l of leases)if(typeof l.worker==='string')leaseMap.set(l.worker,l);
 const peers=s.net_inference&&s.net_inference.peers&&typeof s.net_inference.peers==='object'?s.net_inference.peers:{};
-const current=new Set([...Object.keys(records),...leaseMap.keys()].filter(id=>/^worker-[0-9a-f]{16}$/.test(id)));
+const current=new Set([...Object.keys(records),...leaseMap.keys(),...Object.keys(peers)].filter(id=>/^worker-[0-9a-f]{16}$/.test(id)));
 if(remember&&Array.isArray(s.left_workers))for(const id of s.left_workers)if(!current.has(id))delete workerHistory[id];
 if(remember){for(const id of current){const r=records[id]||{},old=workerHistory[id]||{};workerHistory[id]={updates:Number.isFinite(Number(r.updates))?Number(r.updates):(old.updates||0),last:typeof r.last==='string'?r.last:(old.last||null),seen:serverNow};}
 try{localStorage.setItem(workerHistoryKey,JSON.stringify(workerHistory))}catch(e){}}

@@ -19,9 +19,10 @@ import unittest
 
 def load_actual_source():
     source_path = os.environ.get('DBMOE_SOURCE')
-    if not source_path:
-        return json.loads(Path(__file__).with_name(os.environ.get('DBMOE_SNAPSHOT', 'snapshot.json')).read_text())
-    path = Path(source_path)
+    snapshot_path = os.environ.get('DBMOE_SNAPSHOT')
+    if not source_path and snapshot_path:
+        return json.loads(Path(__file__).with_name(snapshot_path).read_text())
+    path = Path(source_path) if source_path else Path(__file__).with_name('dbmoe.py')
     raw = path.read_bytes()
     source = raw.decode('utf-8')
     lines = source.splitlines(keepends=True)

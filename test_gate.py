@@ -90,6 +90,7 @@ def coordinator(seed=0):
     C.max_steps, C.max_batch, C.min_steps = 400, 64, 1
     C.lock = threading.RLock()
     C.leases, C.data = {}, Source()
+    C.pending_workers = set()
     C.gate_all, C.gate_tol, C.learn_margin, C.gate_strict = True, 0.03, 0.002, False
     C.gate_x, C.gate_slots, C.gate_recent, C.gate_drift, C.check_windows = windows(12, 999), threading.BoundedSemaphore(2), [], {}, 6
     C.shared_bank, C.shared_round, C.round_busy = {}, 12, False

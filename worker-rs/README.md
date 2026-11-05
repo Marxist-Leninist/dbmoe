@@ -4,8 +4,8 @@ The DBMoE worker as one binary: lease a block from a coordinator, train it, send
 training maths in [`dbmoe.py`](../dbmoe.py) to [Burn](https://burn.dev) 0.22, so it needs no Python and no PyTorch:
 
 - **CPU** everywhere, through Burn's pure-Rust Flex backend (SIMD, multi-threaded). The Linux build is fully static.
-- **Any GPU** through wgpu (`--features wgpu`): NVIDIA, AMD, Intel and Apple GPUs via Vulkan, DirectX 12 or Metal,
-  with no CUDA or ROCm install.
+- **Any GPU** through wgpu (`--features wgpu`): NVIDIA, AMD, Intel, Qualcomm Adreno and Apple GPUs via Vulkan,
+  DirectX 12 or Metal, with no CUDA or ROCm install. Windows ARM64/Adreno uses DirectX 12, not OpenCL.
 - **Browsers**, compiled to WebAssembly and running on WebGPU ([`web/`](web/)).
 
 It is experimental. The numbers match PyTorch (below), but it has only trained against local coordinators so far.
@@ -34,8 +34,9 @@ cargo build --release --manifest-path worker-rs/Cargo.toml --features wgpu     #
 ```
 
 The binary is `worker-rs/target/release/dbmoe-worker` (`.exe` on Windows). CI also builds downloadable binaries for
-Linux x86_64 (static, CPU), Linux x86_64 (GPU), Windows x86_64 (static C runtime, GPU) and macOS arm64 (GPU): see the
-`worker-rs` workflow's artifacts.
+Linux x86_64 (static, CPU), Linux x86_64 (GPU), Windows x86_64 and Windows ARM64 (static C runtime, GPU, including
+Adreno through DirectX 12) and macOS arm64 (GPU): see the `worker-rs` workflow's artifacts. The Windows ARM64 job
+runs natively on `windows-11-arm` and repeats the CPU parity check there; an Adreno GPU itself is not yet tested.
 
 ## Run against a local coordinator
 
@@ -64,7 +65,7 @@ updates merged. Leave out `--once` to keep going, add `--device gpu` for a wgpu 
 | --- | --- |
 | `--url URL` | The coordinator (default: the public one, which needs the safetensors format first) |
 | `--token TOKEN` or `--token @FILE` | A token from the coordinator's `tokens.json`. Without one, the worker enrols itself by proof of work and keeps the credential in `~/.dbmoe`, the same file the Python worker uses |
-| `--device cpu`, `gpu`, `igpu`, `dgpu` | CPU (default), or the best/integrated/discrete GPU through wgpu; `dx12`, `vulkan`, `metal` or `opengl` pin a graphics API |
+| `--device cpu`, `gpu`, `igpu`, `dgpu`, `adreno` | CPU (default), or the best/integrated/discrete GPU through wgpu; `adreno` selects the integrated Qualcomm GPU (DirectX 12 on Windows ARM64); `dx12`, `vulkan`, `metal` or `opengl` pin a graphics API |
 | `--threads N` | CPU threads (default 2) |
 | `--steps N`, `--batch N` | Ask for this lease size (0 = the coordinator's default) |
 | `--hours H`, `--once N` | Stop after about H hours, or after N leases |
@@ -119,11 +120,13 @@ python worker-rs/bench/torch_step.py --threads 2
 
 | Build | Runs on | Tested |
 | --- | --- | --- |
-| `--features wgpu` | NVIDIA, AMD, Intel, Apple GPUs through DirectX 12 (Windows), Vulkan (Linux) or Metal (macOS) with `--device gpu`; `dx12`, `vulkan`, `metal`, `opengl` pin one | Intel UHD 620 on Windows: parity passes through DirectX 12 and OpenGL runs; Intel's Vulkan driver crashed, which is why `gpu` means DirectX 12 on Windows. Built in CI for Linux, Windows and macOS |
+| `--features wgpu` | NVIDIA, AMD, Intel, Qualcomm Adreno and Apple GPUs through DirectX 12 (Windows), Vulkan (Linux) or Metal (macOS) with `--device gpu`; `adreno` selects an integrated Qualcomm GPU; `dx12`, `vulkan`, `metal`, `opengl` pin one | Intel UHD 620 on Windows: parity passes through DirectX 12 and OpenGL runs; Intel's Vulkan driver crashed, which is why `gpu` means DirectX 12 on Windows. Built in CI for Linux, Windows x86_64/ARM64 and macOS; ARM64 CPU parity runs natively, but no Adreno GPU has run it yet |
 | `--features cuda` | NVIDIA through CUDA (`--device cuda`); needs the NVIDIA driver and CUDA runtime | not yet built or run |
 | `--features rocm` | AMD through ROCm/HIP (`--device rocm`); needs ROCm | not yet built or run |
 
-OpenCL is not offered: Burn has no OpenCL backend, and the GPUs that have OpenCL drivers have Vulkan too.
+OpenCL is not offered: Burn has no OpenCL backend. On Windows ARM64, Adreno is reached through DirectX 12 rather
+than OpenCL. The outside contributor's reported OpenCL optimization is a separate implementation, not code or a
+benchmark incorporated here.
 
 ## Container
 

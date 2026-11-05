@@ -1898,6 +1898,9 @@ def normalize_hardware(value):
     memory = value.get('gpu_memory_gib')
     if type(memory) in (int, float) and 0 < memory <= 65536:
         out['gpu_memory_gib'] = round(float(memory), 1)
+    kind = value.get('gpu_memory_kind')
+    if isinstance(kind, str) and kind in ('shared', 'dedicated', 'unknown'):
+        out['gpu_memory_kind'] = kind
     return out
 
 
@@ -1915,7 +1918,9 @@ def worker_hardware(device_info, threads):
         report['gpu_memory_gib'] = torch.cuda.get_device_properties(device_info['torch_device']).total_memory / 2**30
     elif backend == 'xpu':
         report['gpu_name'] = device_info['gpu_name']
-        report['gpu_memory_gib'] = torch.xpu.get_device_properties(device_info['torch_device']).total_memory / 2**30
+        props = torch.xpu.get_device_properties(device_info['torch_device'])
+        report['gpu_memory_gib'] = props.total_memory / 2**30
+        report['gpu_memory_kind'] = xpu_memory_kind(props)
     elif backend == 'mps':
         report['gpu_name'] = device_info.get('gpu_name', 'Metal (MPS)')
     return normalize_hardware(report)
@@ -2010,7 +2015,37 @@ def device_smoke_test(device):
     return up['losses']
 
 
-def prepare_worker_device(requested, check_cpu=False):
+def xpu_memory_kind(properties):
+    """Use PyTorch's explicit flag; never guess integrated graphics from a GPU name."""
+    integrated = getattr(properties, 'is_integrated_gpu', None)
+    return ('shared' if integrated else 'dedicated') if type(integrated) is bool else 'unknown'
+
+
+def configure_xpu_memory(info, fraction):
+    """Optional process-local allocator cap, not a reservation or a cap on total host RAM."""
+    if fraction is None:
+        return
+    if type(fraction) not in (int, float) or not math.isfinite(fraction) or not 0 < fraction <= 1:
+        raise ValueError('--xpu-memory-fraction must be finite, greater than 0 and at most 1')
+    if info['backend'] != 'xpu':
+        raise ValueError('--xpu-memory-fraction requires an Intel XPU device; use --device xpu[:N]')
+    setter = getattr(torch.xpu, 'set_per_process_memory_fraction', None)
+    if not callable(setter):
+        raise RuntimeError('This PyTorch XPU build cannot enforce --xpu-memory-fraction. '
+                           'Install a compatible current XPU build; the requested cap was not applied.')
+    device = info['torch_device']
+    try:
+        total = torch.xpu.get_device_properties(device).total_memory
+        if type(total) not in (int, float) or not math.isfinite(total) or total <= 0:
+            raise RuntimeError('PyTorch did not report a valid total device memory size')
+        setter(float(fraction), device=device)
+    except Exception as e:
+        raise RuntimeError(f'Cannot apply the requested XPU memory cap on {device}: {e}') from e
+    info['xpu_memory_fraction'] = float(fraction)
+    info['xpu_allocator_limit_gib'] = round(total * fraction / 2**30, 3)
+
+
+def prepare_worker_device(requested, check_cpu=False, xpu_memory_fraction=None):
     info = resolve_worker_device(requested)
     device = info['torch_device']
     if info['backend'] in ('cuda', 'rocm'):
@@ -2019,8 +2054,10 @@ def prepare_worker_device(requested, check_cpu=False):
     elif info['backend'] == 'xpu':
         torch.xpu.set_device(device)
         info['gpu_name'] = torch.xpu.get_device_name(device)
+        info['gpu_memory_kind'] = xpu_memory_kind(torch.xpu.get_device_properties(device))
     elif info['backend'] == 'mps':
         info['gpu_name'] = 'Metal (MPS)'
+    configure_xpu_memory(info, xpu_memory_fraction)
     if check_cpu or info['backend'] != 'cpu':
         try:
             info['check_losses'] = device_smoke_test(device)
@@ -2033,7 +2070,8 @@ def prepare_worker_device(requested, check_cpu=False):
 def check_device_cmd(a):
     torch.set_num_threads(max(1, a.threads))
     try:
-        info = prepare_worker_device(a.device, check_cpu=True)
+        info = prepare_worker_device(a.device, check_cpu=True,
+                                     xpu_memory_fraction=getattr(a, 'xpu_memory_fraction', None))
     except (ValueError, RuntimeError) as e:
         raise SystemExit(f'[check-device] {e}') from e
     print(json.dumps(dict(ok=True, torch_version=torch.__version__, hip_version=torch.version.hip,
@@ -2237,7 +2275,7 @@ def worker(a):
         pass
     # Prove the requested device works before reading a credential or contacting the coordinator.
     try:
-        device_info = prepare_worker_device(a.device)
+        device_info = prepare_worker_device(a.device, xpu_memory_fraction=getattr(a, 'xpu_memory_fraction', None))
     except (ValueError, RuntimeError) as e:
         sys.exit(f'[worker] {e}')
     device = device_info['torch_device']
@@ -2253,6 +2291,9 @@ def worker(a):
     a.name = getattr(a, 'name', '') or ('worker-' + secrets.token_hex(3))
     hardware = worker_hardware(device_info, a.threads) if getattr(a, 'share_hardware', False) else None
     print(f'[worker] {VERSION} {a.name} -> {base}  device={device} threads={a.threads}', flush=True)
+    if 'xpu_memory_fraction' in device_info:
+        print(f'[worker] XPU allocator cap {device_info["xpu_allocator_limit_gib"]:.3f} GiB '
+              '(not reserved; host RAM and runtime overhead are outside this cap)', flush=True)
     if getattr(a, 'serve_only', False):
         return serve_hops(a, base)
     if not getattr(a, 'no_serve', True):
@@ -2360,6 +2401,10 @@ def main():
     d = sp.add_parser('check-device', help='offline tiny training and serialization test; no token or network')
     d.add_argument('--device', default='cpu', help='cpu, auto, cuda[:N], rocm[:N], xpu[:N] (intel alias), or mps')
     d.add_argument('--threads', type=int, default=2)
+    for parser in (w, d):
+        parser.add_argument('--xpu-memory-fraction', type=float, default=None,
+                            help='optional XPU allocator cap as a fraction of reported total device memory '
+                                 '(0 < fraction <= 1); not free memory or a total host-RAM limit')
     w.add_argument('--threads', type=int, default=2)
     w.add_argument('--steps', type=int, default=0, help='steps per lease (0 = coordinator default)')
     w.add_argument('--batch', type=int, default=0, help='windows per step (0 = coordinator default)')

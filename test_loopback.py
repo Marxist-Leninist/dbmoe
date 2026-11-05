@@ -53,7 +53,8 @@ class LoopbackIntegrationTest(unittest.TestCase):
                         self.assertEqual(worker.returncode, 0, worker.stdout + worker.stderr)
                         with opener.open(url + '/status', timeout=2) as response:
                             status = json.load(response)
-                        stats = status['workers']['local/public-test']
+                        self.assertEqual(len(status['workers']), 1, status['workers'])
+                        stats = next(iter(status['workers'].values()))
                         self.assertEqual('hardware' in stats, opt_in)
                         self.assertNotIn('host', stats)
                         self.assertNotIn('ip', stats)

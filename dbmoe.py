@@ -62,7 +62,7 @@ byte's logits.  A slow or vanished worker's hop is rerouted; if no worker has a 
 and the reply says so.  Results are spot-checked against the snapshot and workers that lie stop being used.  The reply is
 a stream of JSON lines naming the (anonymous) worker behind every hop.
 """
-import argparse, array, base64, collections, hashlib, hmac, http.client as httpc, io, ipaddress, json, math, os, platform, random, secrets, select, socket, sys, threading, time, urllib.error, urllib.parse, urllib.request
+import argparse, array, base64, collections, hashlib, hmac, http.client as httpc, io, ipaddress, json, math, os, platform, random, re, secrets, select, socket, sys, threading, time, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
@@ -2078,6 +2078,107 @@ def check_device_cmd(a):
                           cuda_version=torch.version.cuda, xpu_version=getattr(torch.version, 'xpu', None), **info), indent=2))
 
 
+def report_version(value):
+    """Only a numeric release/prerelease, never a local build suffix, path or arbitrary text."""
+    match = re.match(r'^(\d+\.\d+(?:\.\d+)?(?:(?:a|b|rc|dev)\d+)?)', str(value))
+    return match.group(1)[:32] if match else 'unknown'
+
+
+def report_device(value):
+    spec = str(value).strip().lower()
+    return spec if re.fullmatch(r'(?:cpu|auto|mps(?::0)?|(?:cuda|rocm|hip|xpu|intel)(?::[0-9]{1,8})?)', spec) else 'invalid'
+
+
+def report_hardware(info):
+    """Explicit opt-in model/capacity only. No arbitrary property or diagnostic dumps."""
+    backend, device = info['backend'], info['torch_device']
+    if backend == 'cpu':
+        return dict(gpu='none')
+    if backend == 'mps':
+        return dict(gpu_model='Metal (MPS)', memory_kind='shared_or_unknown')
+    api = torch.xpu if backend == 'xpu' else torch.cuda
+    try:
+        name = api.get_device_name(device)
+        props = api.get_device_properties(device)
+        # Driver model strings are reviewed by the volunteer before publication.
+        # Reject multiline/path/email-shaped values instead of partially copying them.
+        model = name if isinstance(name, str) and len(name) <= 80 and re.fullmatch(r'[A-Za-z0-9 ()+.,_-]+', name) else 'withheld'
+        out = dict(gpu_model=model, memory_kind=xpu_memory_kind(props) if backend == 'xpu' else 'dedicated_or_unknown')
+        total = props.total_memory
+        if type(total) in (int, float) and math.isfinite(total) and 0 < total <= 65536 * 2**30:
+            out['total_device_memory_gib'] = round(total / 2**30, 1)
+        return out
+    except Exception:
+        return dict(available=False)
+
+
+def hardware_report(requested, threads=2, include_hardware=False, xpu_memory_fraction=None):
+    """Run one offline check and build a local, reviewable report. Never send it anywhere."""
+    os_name, arch = platform.system(), platform.machine().lower()
+    report = dict(schema='dbmoe.hardware-report.v1', report_id=secrets.token_hex(6),
+                  generated_at_utc=time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime()),
+                  dbmoe_version=VERSION, test_scope='tiny_synthetic_offline',
+                  self_reported=True, independently_verified=False,
+                  full_model_capacity_tested=False, network_training_tested=False,
+                  requested_device=report_device(requested),
+                  environment=dict(os_family=os_name if os_name in ('Linux', 'Windows', 'Darwin') else 'other',
+                                   architecture=arch if arch in ('x86_64', 'amd64', 'aarch64', 'arm64', 'x86', 'i386',
+                                                               'i686', 'armv7l', 'ppc64le', 'riscv64') else 'other',
+                                   torch_version=report_version(torch.__version__)),
+                  hardware_opt_in=bool(include_hardware), result='failed', stage='device_selection')
+    try:
+        with open(__file__, 'rb') as source:
+            report['source_sha256'] = hashlib.sha256(source.read()).hexdigest()
+    except OSError:
+        report['source_sha256'] = 'unavailable'
+    selected = None
+    try:
+        if type(threads) is not int or not 1 <= threads <= 4096:
+            raise ValueError('invalid thread count')
+        torch.set_num_threads(threads)
+        selected = resolve_worker_device(requested)
+        report['selected_device'] = selected['device']
+        report['backend'] = selected['backend']
+        report['stage'] = 'offline_preflight'
+        runtime = getattr(torch.version, 'hip' if selected['backend'] == 'rocm' else
+                          'cuda' if selected['backend'] == 'cuda' else 'xpu', None)
+        if selected['backend'] in ('cuda', 'rocm', 'xpu'):
+            report['environment']['runtime_version'] = report_version(runtime)
+        info = prepare_worker_device(selected['torch_device'], check_cpu=True,
+                                     xpu_memory_fraction=xpu_memory_fraction)
+        report.update(result='passed', stage='complete', checks=['forward_backward', 'adamw', 'bounded_cpu_deltas', 'safe_serialization'])
+        if 'xpu_memory_fraction' in info:
+            report['xpu_memory_fraction'] = info['xpu_memory_fraction']
+            if include_hardware:
+                report['xpu_allocator_limit_gib'] = info['xpu_allocator_limit_gib']
+    except ValueError:
+        report['failure_category'] = 'invalid_device_or_options'
+    except RuntimeError:
+        report['failure_category'] = 'backend_unavailable' if report['stage'] == 'device_selection' else 'runtime_or_training_failure'
+    except Exception:
+        report['failure_category'] = 'unexpected_error'
+    if include_hardware and selected is not None:
+        report['hardware'] = report_hardware(selected)
+    return report
+
+
+def hardware_report_cmd(a):
+    report = hardware_report(a.device, threads=a.threads, include_hardware=a.include_hardware,
+                             xpu_memory_fraction=a.xpu_memory_fraction)
+    payload = json.dumps(report, indent=2, allow_nan=False) + '\n'
+    if a.output == '-':
+        print(payload, end='')
+    else:
+        try:
+            with open(os.path.expanduser(a.output), 'x', encoding='utf-8') as destination:
+                destination.write(payload)
+        except OSError:
+            raise SystemExit('[hardware-report] Could not create output; choose an unused writable filename.') from None
+        print('[hardware-report] Saved locally. Review before sharing; nothing was uploaded.')
+    if report['result'] != 'passed':
+        raise SystemExit(1)
+
+
 def token_path(base):
     return os.path.join(os.path.expanduser('~'), '.dbmoe', hashlib.sha256(base.encode()).hexdigest()[:12] + '.token')
 
@@ -2401,7 +2502,12 @@ def main():
     d = sp.add_parser('check-device', help='offline tiny training and serialization test; no token or network')
     d.add_argument('--device', default='cpu', help='cpu, auto, cuda[:N], rocm[:N], xpu[:N] (intel alias), or mps')
     d.add_argument('--threads', type=int, default=2)
-    for parser in (w, d):
+    r = sp.add_parser('hardware-report', help='opt-in offline compatibility report; local output only, no upload')
+    r.add_argument('--device', default='cpu', help='cpu, auto, cuda[:N], rocm[:N], xpu[:N], or mps')
+    r.add_argument('--threads', type=int, default=2)
+    r.add_argument('--output', default='-', help='new local JSON file, or - for stdout; existing files are never overwritten')
+    r.add_argument('--include-hardware', action='store_true', help='include GPU model and total memory for your review; never uploads them')
+    for parser in (w, d, r):
         parser.add_argument('--xpu-memory-fraction', type=float, default=None,
                             help='optional XPU allocator cap as a fraction of reported total device memory '
                                  '(0 < fraction <= 1); not free memory or a total host-RAM limit')
@@ -2424,7 +2530,7 @@ def main():
             s.add_argument('--heldout', required=True)
     a = p.parse_args()
     {'coord': serve, 'enrol': enrol_cmd, 'token': enrol_cmd, 'worker': worker, 'sample': sample_cmd, 'eval': eval_cmd,
-     'check-device': check_device_cmd}[a.cmd](a)
+     'check-device': check_device_cmd, 'hardware-report': hardware_report_cmd}[a.cmd](a)
 
 
 if __name__ == '__main__':

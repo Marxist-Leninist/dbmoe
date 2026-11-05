@@ -1,0 +1,74 @@
+name: Hardware compatibility report
+description: Voluntarily report a device test or failure. Reports are public and self-reported.
+title: "[Hardware report] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue is PUBLIC and associated with your GitHub account. Posting is optional.
+        Nothing is uploaded by the DBMoE hardware-report command. Review the JSON before pasting it.
+        Do not paste tokens, raw logs/tracebacks, IP addresses, hostnames, serial numbers, local paths, prompts or private data.
+        Use an existing report issue for later results on the same setup. Updates are manual, not automatic monitoring.
+        A passed tiny test does not establish full-model capacity, sustained stability or independently verified hardware support.
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Test outcome
+      options:
+        - Passed the offline tiny test
+        - Failed the offline tiny test
+        - Could not run the test or import PyTorch
+        - A real worker run failed after preflight
+        - A real worker run completed
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Requested backend
+      options:
+        - CPU
+        - NVIDIA CUDA
+        - AMD ROCm
+        - Intel XPU (discrete GPU)
+        - Intel XPU (integrated GPU)
+        - Apple MPS
+        - Auto or unknown
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Reviewed local JSON report
+      description: Generate with hardware-report. GPU model/memory are optional via --include-hardware. Leave blank if the command could not start.
+      render: json
+  - type: textarea
+    id: setup
+    attributes:
+      label: Optional public setup details
+      description: Only details you choose to publish, such as GPU model, OS distribution/release and driver version. No device serial, account, hostname, path or network information.
+  - type: dropdown
+    id: failure
+    attributes:
+      label: Failure category, if known
+      options:
+        - Not applicable or unknown
+        - Device/backend unavailable
+        - PyTorch installation or import failure
+        - Offline training check failed
+        - Memory allocation failed
+        - Real worker/network run failed
+  - type: textarea
+    id: steps
+    attributes:
+      label: Optional safe reproduction and follow-up
+      description: Describe the stage and safe steps without credentials, URLs containing secrets, raw logs or private data. For a later test, comment in this same issue with a newly reviewed report and note what changed.
+  - type: checkboxes
+    id: consent
+    attributes:
+      label: Voluntary public sharing
+      options:
+        - label: I reviewed this report and choose to publish these details publicly under my GitHub account. Reports and later updates are self-reported, not independent hardware certification.
+          required: true
+        - label: I understand this feature sends no automatic uploads or follow-up messages. I can stop posting updates, and GitHub controls issue notifications and public-content removal.
+          required: true

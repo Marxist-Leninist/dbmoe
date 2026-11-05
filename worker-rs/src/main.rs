@@ -23,8 +23,9 @@ worker   Lease a block, train it, send the change back, repeat. Without --token 
 parity   Repeat the reference training step in apple/parity.json and compare every number with PyTorch.
 bench    Time training steps of the live model configuration on random bytes.
 
---device  cpu (default) is Burn's pure-Rust CPU backend. gpu picks the best GPU through wgpu (Vulkan,
-          DirectX 12 or Metal); igpu/dgpu ask for an integrated/discrete one. Needs a build with --features wgpu.
+--device  cpu (default) is Burn's pure-Rust CPU backend. gpu picks the best GPU through wgpu (DirectX 12 on
+          Windows, Vulkan on Linux, Metal on macOS); igpu/dgpu ask for an integrated/discrete one; dx12, vulkan,
+          metal and opengl pin a graphics API. Needs a build with --features wgpu.
 --threads CPU threads (default 2 for worker, all cores for bench).";
 
 struct Opts {

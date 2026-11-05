@@ -39,22 +39,33 @@ pub fn block_on<F: core::future::Future>(f: F) -> F::Output {
 /// The device for a name given on the command line or by a web page.
 ///
 /// `cpu` (or `flex`) is Burn's pure-Rust CPU backend, always available. `gpu` (or `wgpu`) is the best GPU that
-/// wgpu finds (Vulkan, DirectX 12 or Metal; WebGPU in a browser), `igpu` an integrated one. `vulkan`, `metal`,
-/// `webgpu`, `cuda` and `rocm` pin one API. GPU names need the matching cargo feature.
+/// wgpu finds (DirectX 12 on Windows, Vulkan on Linux, Metal on macOS, WebGPU in a browser), `igpu`/`dgpu` an
+/// integrated/discrete one, `auto` CubeCL's own pick. `dx12`, `vulkan`, `metal`, `opengl`, `webgpu`, `cuda` and
+/// `rocm` pin one API. GPU names need the matching cargo feature.
 pub fn device_from_name(name: &str) -> Result<Device, String> {
     let n = name.trim().to_ascii_lowercase();
     match n.as_str() {
         "" | "cpu" | "flex" => Ok(Device::flex()),
         #[cfg(feature = "wgpu")]
-        "gpu" | "wgpu" | "auto" => Ok(Device::wgpu(burn::tensor::DeviceKind::DefaultDevice)),
+        "gpu" | "wgpu" => gpu(burn::tensor::DeviceKind::DefaultDevice),
         #[cfg(feature = "wgpu")]
-        "dgpu" | "discrete" => Ok(Device::wgpu(burn::tensor::DeviceKind::DiscreteGpu(0))),
+        "dgpu" | "discrete" => gpu(burn::tensor::DeviceKind::DiscreteGpu(0)),
         #[cfg(feature = "wgpu")]
-        "igpu" | "integrated" => Ok(Device::wgpu(burn::tensor::DeviceKind::IntegratedGpu(0))),
+        "igpu" | "integrated" => gpu(burn::tensor::DeviceKind::IntegratedGpu(0)),
+        #[cfg(feature = "wgpu")]
+        "auto" => Ok(Device::wgpu(burn::tensor::DeviceKind::DefaultDevice)),
         #[cfg(feature = "vulkan")]
         "vulkan" => Ok(Device::vulkan(burn::tensor::DeviceKind::DefaultDevice)),
+        #[cfg(all(feature = "wgpu", not(feature = "vulkan"), not(target_family = "wasm")))]
+        "vulkan" => pinned(burn::tensor::wgpu::WgpuBackend::Vulkan),
         #[cfg(feature = "metal")]
         "metal" | "mps" => Ok(Device::metal(burn::tensor::DeviceKind::DefaultDevice)),
+        #[cfg(all(feature = "wgpu", not(feature = "metal"), not(target_family = "wasm")))]
+        "metal" | "mps" => pinned(burn::tensor::wgpu::WgpuBackend::Metal),
+        #[cfg(all(feature = "wgpu", not(target_family = "wasm")))]
+        "dx12" | "directx" => pinned(burn::tensor::wgpu::WgpuBackend::Dx12),
+        #[cfg(all(feature = "wgpu", not(target_family = "wasm")))]
+        "opengl" | "gl" => pinned(burn::tensor::wgpu::WgpuBackend::Gl),
         #[cfg(feature = "webgpu")]
         "webgpu" => Ok(Device::webgpu(burn::tensor::DeviceKind::DefaultDevice)),
         #[cfg(feature = "cuda")]
@@ -68,11 +79,37 @@ pub fn device_from_name(name: &str) -> Result<Device, String> {
     }
 }
 
+/// A GPU of this kind. On Windows that means DirectX 12 rather than CubeCL's Vulkan-first default: on an Intel UHD 620
+/// (Latitude 5400) Intel's Vulkan driver crashed the process, while DirectX 12 ran the same step and matched PyTorch.
+/// Elsewhere wgpu picks (Vulkan on Linux, Metal on macOS, WebGPU in browsers). `--device auto` keeps CubeCL's choice.
+#[cfg(all(feature = "wgpu", target_os = "windows"))]
+fn gpu(kind: burn::tensor::DeviceKind) -> Result<Device, String> {
+    Device::wgpu_options()
+        .device_kind(kind)
+        .graphics_api(burn::tensor::wgpu::WgpuBackend::Dx12)
+        .init()
+        .map_err(|e| format!("GPU through DirectX 12: {e} (try --device vulkan, opengl or cpu)"))
+}
+
+#[cfg(all(feature = "wgpu", not(target_os = "windows")))]
+fn gpu(kind: burn::tensor::DeviceKind) -> Result<Device, String> {
+    Ok(Device::wgpu(kind))
+}
+
+/// The default GPU through one pinned graphics API (native builds).
+#[cfg(all(feature = "wgpu", not(target_family = "wasm")))]
+fn pinned(api: burn::tensor::wgpu::WgpuBackend) -> Result<Device, String> {
+    Device::wgpu_options().graphics_api(api).init().map_err(|e| format!("GPU through {api:?}: {e}"))
+}
+
 /// Device names this build accepts.
 pub fn known_devices() -> Vec<&'static str> {
     let mut v = vec!["cpu"];
     if cfg!(feature = "wgpu") {
-        v.extend(["gpu", "dgpu", "igpu"]);
+        v.extend(["gpu", "dgpu", "igpu", "auto"]);
+        if cfg!(not(target_family = "wasm")) {
+            v.extend(["dx12", "vulkan", "metal", "opengl"]);
+        }
     }
     if cfg!(feature = "vulkan") {
         v.push("vulkan");

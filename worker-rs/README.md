@@ -64,7 +64,7 @@ updates merged. Leave out `--once` to keep going, add `--device gpu` for a wgpu 
 | --- | --- |
 | `--url URL` | The coordinator (default: the public one, which needs the safetensors format first) |
 | `--token TOKEN` or `--token @FILE` | A token from the coordinator's `tokens.json`. Without one, the worker enrols itself by proof of work and keeps the credential in `~/.dbmoe`, the same file the Python worker uses |
-| `--device cpu`, `gpu`, `igpu`, `dgpu` | CPU (default), or the best/integrated/discrete GPU through wgpu |
+| `--device cpu`, `gpu`, `igpu`, `dgpu` | CPU (default), or the best/integrated/discrete GPU through wgpu; `dx12`, `vulkan`, `metal` or `opengl` pin a graphics API |
 | `--threads N` | CPU threads (default 2) |
 | `--steps N`, `--batch N` | Ask for this lease size (0 = the coordinator's default) |
 | `--hours H`, `--once N` | Stop after about H hours, or after N leases |
@@ -84,17 +84,34 @@ worker-rs/target/release/dbmoe-worker parity --fixture apple/parity.json
 
 On the CPU all 87 checks pass with a largest absolute error of 8.3e-7 (the test requires 1e-5): the loss to 4.8e-7,
 logits to 8.3e-7, gradients to 4.6e-7 or better, and the parameters after AdamW are bit-identical for 13 of 20
-tensors and within 4.7e-10 (one float32 rounding step) for the rest. CI also regenerates the fixture from the current `dbmoe.py`, in the
-balanced and the `--skewed` routing case (which exercises the load-balancing gradient), and checks both.
-`cargo test` runs the same check.
+tensors and within 4.7e-10 (one float32 rounding step) for the rest. CI repeats this on Linux x86_64, Windows x86_64
+and macOS arm64, also with fixtures regenerated from the current `dbmoe.py` in the balanced and the `--skewed`
+routing case (which exercises the load-balancing gradient); the largest error there is 1.1e-6. On a GPU (Intel UHD
+620 through DirectX 12) the step passes with a largest error of 9.5e-7. `cargo test` runs the CPU check.
 
 ## Speed
 
-`dbmoe-worker bench` times full training steps (forward, backward, clipping, AdamW) of the live model size on
-random bytes; `bench/torch_step.py` times the same step in PyTorch. CI prints both on every runner.
+Seconds per training step of the live model (d=256, 4 layers, 4 experts, ffn 528; batch 8 x 256 bytes; forward,
+backward, clipping and AdamW), median of 3 to 5 steps, 2 CPU threads, both measured on the same machine:
+
+| Machine | PyTorch | Rust, CPU | Rust, GPU |
+| --- | --- | --- | --- |
+| Latitude 5400 laptop (Core i5-8365U, Intel UHD 620), Windows | 0.94 s (torch 2.14) | 2.68 s | 6.0 s (UHD 620, DirectX 12) |
+| GitHub runner, Linux x86_64 | 0.29 s (torch 2.15) | 0.78 s | |
+| GitHub runner, Windows x86_64 | 0.43 s | 1.10 s | |
+| GitHub runner, macOS arm64 | 0.26 s | 1.10 s | |
+
+Plainly: on CPUs PyTorch is 2.5 to 4.3 times faster than this worker today, and on the laptop the integrated GPU
+is slower than the CPU. The GPU's first steps also compile shaders (344 s and 78 s on the UHD 620 before steps
+settled near 6 s, and one 29 s step later, when the expert loads produced tensor sizes it had not seen). No discrete
+GPU has run it yet. What the Rust worker offers now is reach: an 8 MB static binary, any GPU through DirectX,
+Vulkan or Metal without a CUDA or ROCm install, and browsers. Known places to make it faster: 2 and 4 threads take
+the same time on the CPU, so the time goes somewhere other than the parallel matrix products (profiling is next);
+routing reads the router's choices back once per layer; and per-expert batch sizes change every step, which makes GPU
+backends compile new kernels (padding expert batches to a few fixed sizes would bound that).
 
 ```sh
-worker-rs/target/release/dbmoe-worker bench --threads 2
+worker-rs/target/release/dbmoe-worker bench --threads 2                 # add --device gpu with a wgpu build
 python worker-rs/bench/torch_step.py --threads 2
 ```
 
@@ -102,7 +119,7 @@ python worker-rs/bench/torch_step.py --threads 2
 
 | Build | Runs on | Tested |
 | --- | --- | --- |
-| `--features wgpu` | NVIDIA, AMD, Intel, Apple GPUs through Vulkan, DirectX 12 or Metal (`--device gpu`) | built in CI for Linux, Windows and macOS |
+| `--features wgpu` | NVIDIA, AMD, Intel, Apple GPUs through DirectX 12 (Windows), Vulkan (Linux) or Metal (macOS) with `--device gpu`; `dx12`, `vulkan`, `metal`, `opengl` pin one | Intel UHD 620 on Windows: parity passes through DirectX 12 and OpenGL runs; Intel's Vulkan driver crashed, which is why `gpu` means DirectX 12 on Windows. Built in CI for Linux, Windows and macOS |
 | `--features cuda` | NVIDIA through CUDA (`--device cuda`); needs the NVIDIA driver and CUDA runtime | not yet built or run |
 | `--features rocm` | AMD through ROCm/HIP (`--device rocm`); needs ROCm | not yet built or run |
 
@@ -110,8 +127,8 @@ OpenCL is not offered: Burn has no OpenCL backend, and the GPUs that have OpenCL
 
 ## Container
 
-[`Dockerfile`](Dockerfile) puts the static CPU worker on an empty base image (CI builds it and runs the parity check
-inside). On Linux a container shares the host kernel, so CPU training runs at native speed; Docker Desktop on
+[`Dockerfile`](Dockerfile) puts the static CPU worker on an empty base image of 8 MB (CI builds it and runs the
+parity check inside). On Linux a container shares the host kernel, so CPU training runs at native speed; Docker Desktop on
 Windows and macOS runs a Linux VM. For a GPU, run the native binary.
 
 ```sh

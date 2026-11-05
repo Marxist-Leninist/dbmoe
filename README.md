@@ -98,6 +98,8 @@ Expect a nonempty HIP version, GPU availability `True`, and a successful `check-
 
 Then join with `python3 dbmoe.py worker --device rocm --threads 2 --batch 1`.
 
+The AMD device check is integrated into the deployed anonymous worker. Physical AMD training validation is still required before claiming a tested AMD release; the mocked backend suite is not hardware proof.
+
 Use `--device rocm:1` for the second visible GPU, or `--device cuda:1` on NVIDIA. Each worker uses one GPU; `--threads` controls PyTorch CPU threads. Start with batch 1 when available VRAM is uncertain. A coordinator can limit requested batch sizes, and full-size model weights plus optimizer state must still fit. Reduce the batch if training runs out of memory; a successful tiny check is not a guarantee that a live lease will fit.
 
 [PyTorch deliberately uses its `torch.cuda` API and `cuda:N` tensor devices on ROCm](https://docs.pytorch.org/docs/stable/notes/hip.html). DBMoE's `rocm`/`hip` aliases map to that API and require a HIP-enabled build. Existing `--device cuda` commands still work on ROCm and report the backend honestly as `rocm:N`. A CUDA wheel does not add AMD support.
@@ -113,6 +115,8 @@ MacBook Air/Pro, iMac, Mac mini, Mac Studio and Mac Pro can use the Python worke
 **MPS worker support is implemented and regression-tested on Linux with mocked device selection. It has not yet been validated on physical Apple hardware.** The runtime check below must pass on the particular Mac before it joins. It tests a tiny synthetic model, not full-model memory capacity or long-running stability.
 
 Use [Apple's PyTorch installation guide](https://developer.apple.com/metal/pytorch/) and the [PyTorch installation selector](https://pytorch.org/get-started/locally/) for the selected release. Requirements change by release: Apple's guide currently lists Apple silicon and macOS 14+ for its documented stable build. Older releases have different requirements. Do not use the Linux CPU wheel index on macOS, install CUDA/ROCm packages on a Mac, or bypass unsupported-OS checks.
+
+For the MPS checks, use the current `dbmoe.py` from this repository or `/code`; both include the MPS path and anonymous protocol. The offline check runs before any credential read or network request. Physical Apple-hardware validation remains pending; do not infer support from mocked tests alone.
 
 Run the checks first:
 
@@ -150,6 +154,8 @@ Apple TV and Apple Vision Pro would need separate native UI/runtime/device valid
 
 Each worker's card shows its CPU model, core and thread counts, RAM, GPU model and memory, operating system and PyTorch version, as the worker reports them, plus the speed the coordinator measures. The worker prints exactly what it is sharing when it starts. No hostname, address, serial number or path is sent, and workers appear under an anonymous ID. `--no-share-hardware` keeps the hardware off the list, and the next accepted update removes an earlier report.
 
+These reports come from participants and are not independently verified. The thread count is what PyTorch was given, not the machine's physical cores, and GPU memory is the total, not what is free. The coordinator and network provider necessarily see connection IP addresses.
+
 ## Tests
 
 ```sh
@@ -166,13 +172,33 @@ The unit suite covers CPU training, optimizer-state reuse, the update test, coor
 ## How it works
 
 - Byte vocabulary of 256 with tied embedding and output weights. By default, six blocks of two causal transformer layers with a top-1, four-expert feed-forward network, width 256, four attention heads and context length 256.
+- The 1.6B reference configuration (`CFG_1P6B`) has 1,611,827,201 parameters in 24 blocks: width 1024, 16 heads, two transformer layers per block, eight experts and FFN 1728, with context 256.
 - What is noised is the embedding of the next byte. Each block learns its own slice of a log-normal noise distribution, widened by the paper's overlap, with EDM preconditioning and weighting.
-- Generation runs the blocks as a diffusion sampler for the next byte, one Euler step per block, so a byte costs one pass through the layers.
+- Generation runs the blocks as a diffusion sampler for the next byte, one Euler step per block, so a byte costs one pass through the layers. The coordinator measures `chain` and `top` sampling on real text and serves the better-scoring mode by default; both stay selectable.
 - Workers receive jobs over HTTPS and return parameter deltas. Merging is asynchronous averaging. Shared parameters (embedding, positions) define the target every block denoises toward, so their deltas are banked and go in together every 12 updates.
+- Before merging, the coordinator validates keys, shapes, finite values, step and token counts, saturation and delta bounds. Block updates are checked against a retained lease sample and held-out text; shared deltas are banked into rounds and checked at their actual commit.
 - Compute goes where it's needed: low-noise blocks can read the target off their input, so more updates teach them little, and the blocks with most left to learn get the most work.
 - Workers keep Adam's per-parameter scale between jobs on a block and drop its momentum, which points where the old weights wanted to go.
 - Evaluation measures the chain at each depth and scores generated text against the statistics of real text, because block losses alone can't show whether generation works.
+- One inference snapshot and one optimizer state are kept per worker to cap memory, and lease and block downloads are bounded so large models don't cause download stampedes.
 - Payloads load with `torch.load(..., weights_only=True)`, so nothing a participant sends can run code.
+
+Validation is not a guarantee against malicious training updates. Treat the coordinator as experimental infrastructure.
+
+## 1.6B reference coordinator
+
+The reference configuration is 24 blocks, about **268.5 MB of FP32 block weights per lease** and a **6.45 GB** full checkpoint. Start it only with resources for that checkpoint and its gate evaluations. The public run keeps the previous 16M coordinator as a rollback lane.
+
+```sh
+python dbmoe.py coord --dir run-1p6b --host 127.0.0.1 --port 8791 \
+  --tokens tokens.json \
+  --hf "HuggingFaceFW/fineweb-edu:sample/10BT/*.parquet" \
+  --cfg '{"vocab":256,"d":1024,"heads":16,"layers_per_block":2,"blocks":24,"experts":8,"ffn":1728,"ctx":256,"aux":0.01}' \
+  --steps 4 --batch 1 --max-steps 16 --max-batch 4 \
+  --heldout 4 --eval-every 0 --snap-every 0 --max-upload-mb 768
+```
+
+Increase upload limits only as needed for the block size. Retained snapshots are disabled in this example because the checkpoint is large; use Hugging Face for verified backups. Every participant is gated by default, including trusted tokens. Daily participant and lifetime job caps are disabled; capacity backpressure, proof of work, lease slots and quality checks remain active.
 
 ## Local coordinator
 

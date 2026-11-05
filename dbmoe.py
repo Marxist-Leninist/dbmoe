@@ -834,10 +834,16 @@ def decode_floats(s, n):
 
 
 def sock_alive(sock):
+    """True while the peer keeps the connection open: nothing readable, or real data waiting (EOF or an error means gone)."""
     try:
-        p = select.poll()
-        p.register(sock, select.POLLIN | select.POLLHUP | select.POLLERR)
-        return not p.poll(0) or bool(sock.recv(1, socket.MSG_PEEK))
+        if hasattr(select, 'poll'):
+            p = select.poll()
+            p.register(sock, select.POLLIN | select.POLLHUP | select.POLLERR)
+            ready = p.poll(0)
+        else:   # Windows has no poll(); select() on one socket has no descriptor-number limit there
+            readable, _, broken = select.select([sock], [], [sock], 0)
+            ready = readable or broken
+        return not ready or bool(sock.recv(1, socket.MSG_PEEK))
     except Exception:
         return False
 

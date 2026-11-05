@@ -1,0 +1,63 @@
+name: tests
+
+# Runs the full unit suite on real Linux, Windows and Apple Silicon (macos-latest is arm64) machines.
+# GPU paths are exercised where the runner has the hardware (MPS on Apple Silicon if the
+# hosted runner exposes Metal); CUDA, ROCm and XPU tests skip themselves when absent.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      OMP_NUM_THREADS: "2"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyTorch (CPU build on Linux/Windows; default build with MPS on macOS)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            pip install torch
+          else
+            pip install torch --index-url https://download.pytorch.org/whl/cpu
+          fi
+          pip install -r requirements.txt
+      - name: Report hardware seen by PyTorch
+        shell: bash
+        run: |
+          python - <<'PY'
+          import platform, torch
+          print(platform.platform(), platform.machine(), "python", platform.python_version())
+          print("torch", torch.__version__, "| cuda", torch.cuda.is_available(),
+                "| mps", getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available(),
+                "| xpu", hasattr(torch, "xpu") and torch.xpu.is_available())
+          PY
+      - name: Unit tests
+        shell: bash
+        env:
+          DBMOE_SOURCE: ${{ github.workspace }}/dbmoe.py
+        run: python -m unittest discover -p "test_*.py" -v
+      - name: Dashboard worker-list contracts
+        if: runner.os == 'Linux'
+        run: node test_dashboard_workers.js

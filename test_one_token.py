@@ -1,5 +1,6 @@
 """One minted token runs a whole network of machines, each under its own name."""
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -40,7 +41,8 @@ class OneTokenManyMachines(unittest.TestCase):
                     '--batch', '1', '--heldout', '2', '--eval-every', '0', '--snap-every', '0',
                     '--eval-threads', '1', '--join-bits', '4', '--min-steps', '1'], stdout=log, stderr=subprocess.STDOUT)
                 try:
-                    deadline = time.monotonic() + 20
+                    # a cold Python + PyTorch start on a fresh CI runner (notably macOS) can exceed 20 s
+                    deadline = time.monotonic() + float(os.environ.get('DBMOE_TEST_START_TIMEOUT', 120))
                     while True:
                         try:
                             if get('/status')[0] == 200:
@@ -55,7 +57,8 @@ class OneTokenManyMachines(unittest.TestCase):
                     r = subprocess.run([sys.executable, script, 'enrol', '--url', url, '--token-file', str(path)],
                                        capture_output=True, text=True, timeout=60)
                     self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                    if sys.platform != 'win32':     # Windows has no POSIX permission bits; chmod only toggles read-only
+                        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
                     token = path.read_text().strip()
                     self.assertNotIn(token, r.stdout + r.stderr)
                     # machines of one network start at the same moment

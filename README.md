@@ -174,6 +174,12 @@ With `--share-hardware`, add it to opt in to publishing self-reported hardware d
 
 Without this flag, no detailed hardware report is sent. Device/backend and participation statistics are still sent as before. New workers do not transmit machine hostnames, IP fields, serial numbers or local paths in update payloads; the coordinator/network provider necessarily sees connection IPs. Choose an explicit public pseudonym, or omit `--name` for a random worker label. The coordinator strips legacy host/IP fields from public status and accepts only the documented hardware fields. Restart without the flag to withdraw the report on the next accepted update; prior logs/backups may still retain earlier reports. Older coordinators may ignore this optional metadata, and website display requires coordinator/page support.
 
+## Voluntary hardware reports
+
+If you test hardware the project has not validated, generate a local report with `python dbmoe.py hardware-report --device xpu --output hardware-report.json` (choose your backend). Add `--include-hardware` only if you want GPU model/memory in the file. Nothing is uploaded or joined automatically. Failures produce fixed safe categories instead of raw logs. Review the JSON, then optionally submit it through the [public hardware-report form](https://github.com/Marxist-Leninist/dbmoe/issues/new?template=hardware-compatibility.yml), associated with your GitHub account.
+
+[Reporting/privacy details and opt-out](docs/hardware-compatibility.md) explain the fields, how to update the same issue after a meaningful change, and why volunteer passes remain self-reported rather than independently verified. [Recent hardware reports](https://github.com/Marxist-Leninist/dbmoe/issues?q=is%3Aissue+in%3Atitle+%22%5BHardware+report%5D%22&s=updated&o=desc) track published findings. This is a manual tracker, not an automatic monitoring or telemetry service.
+
 ## Tests
 
 ```sh

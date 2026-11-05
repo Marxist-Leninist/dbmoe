@@ -1,6 +1,6 @@
 # DiffusionBlocks-MoE (DBMoE)
 
-A byte-level language model trained and run by computers anywhere. Each worker trains one noise-range block of a mixture-of-experts model and serves that block for inference, following the recipe of [DiffusionBlocks](https://arxiv.org/abs/2506.14202) (Shing, Koyama and Akiba, ICLR 2026). A block needs no other block's activations or gradients, so machines never have to talk to each other.
+A byte-level language model trained and run by computers anywhere. Each worker trains one noise-range block of a mixture-of-experts model and serves that block for inference, following the recipe of [DiffusionBlocks](https://arxiv.org/abs/2506.14202) (Shing, Koyama and Akiba, ICLR 2026). A block needs no other block's activations or gradients, so machines never have to talk to each other. It is experimental; workers can train on CPU, NVIDIA CUDA, AMD ROCm, Intel XPU or Apple Mac MPS.
 
 - Live progress: https://codex.opentransformers.online/dbmoe/progress
 - Coordinator: https://codex.opentransformers.online/dbmoe
@@ -28,7 +28,7 @@ python3 dbmoe.py worker --threads 4
 
 | Option | What it does |
 | --- | --- |
-| `--device cuda`, `rocm`, `mps` or `auto` | Train on an NVIDIA, AMD or Mac GPU, or pick what's there. The default is CPU. See the sections below. |
+| `--device cuda`, `rocm`, `xpu`, `mps` or `auto` | Train on an NVIDIA, AMD, Intel or Mac GPU, or pick what's there. The default is CPU. See the sections below. |
 | `--threads N` | CPU threads to use (default 2) |
 | `--hours N` | Stop after about this long, checked between jobs |
 | `--no-serve` | Train only, no inference |
@@ -108,6 +108,34 @@ Native Windows and WSL have separate, hardware- and release-specific AMD support
 
 If the check fails, confirm the installed wheel, supported GPU/OS, driver and device visibility/permissions against AMD's guide. An AMD GPU name appearing in an OS utility is not enough: PyTorch must load its kernels and complete backward propagation. `--device rocm` never silently falls back to CPU.
 
+## Intel GPUs (XPU)
+
+**Intel support is implemented through native PyTorch `torch.xpu`, but has not been validated on physical Intel hardware for this release.** The worker uses its existing FP32 training and CPU-tensor update format. It does not require Intel Extension for PyTorch, CUDA, a custom kernel, or a different coordinator protocol.
+
+Check your exact GPU and OS against [PyTorch's Intel GPU guide](https://docs.pytorch.org/docs/stable/notes/get_start_xpu.html) and follow the matching [Intel GPU prerequisites](https://www.intel.com/content/www/us/en/developer/articles/tool/pytorch-prerequisites-for-intel-gpu.html). Supported Arc discrete GPUs, selected Core Ultra integrated GPUs and Data Center GPU Max systems have different requirements. Do not assume every Intel iGPU, an older Intel Mac, or an Intel NPU supports this path. Linux, Windows and WSL2 support depends on the hardware/release matrix.
+
+In a fresh virtual environment, after installing the supported Intel driver/runtime, install the official stable XPU wheel (DBMoE needs only `torch`):
+
+```bash
+python -m pip install torch --index-url https://download.pytorch.org/whl/xpu
+python -c "import torch; print(torch.__version__); print(torch.xpu.is_available()); print(torch.xpu.device_count())"
+python dbmoe.py check-device --device xpu
+```
+
+Use a Python version supported by that wheel. A CPU/CUDA/ROCm wheel or `pip install -r requirements.txt` alone does not select Intel GPU support. Follow the official binary-install instructions, not source-build-only environment setup, when using wheels.
+
+The offline check runs the real tiny DBMoE forward pass, backward pass and AdamW update on the selected XPU, then verifies finite bounded FP32 deltas copied to CPU and serialized. It reads no token, makes no network request and changes no training checkpoint. Every XPU worker runs the same check before reading a credential or joining. If it fails, fix the driver/wheel/device compatibility first; `--device xpu` never silently switches to CPU.
+
+After the check passes, using the reviewed `dbmoe.py` from this branch/release:
+
+```bash
+python dbmoe.py worker --url https://codex.opentransformers.online/dbmoe --device xpu --steps 2 --batch 1 --threads 2
+```
+
+Use `--device xpu:1` for the second visible Intel GPU; `intel` and `intel:N` are aliases and report `xpu:N`. Each worker uses one GPU. A tiny check does not prove a full lease fits in memory or establish sustained throughput. Start with batch 1, monitor system/GPU memory and temperature, and stop with Ctrl-C. Integrated GPUs share system memory, and PyTorch's reported total device memory is not free or necessarily dedicated VRAM. CPU remains available with `--device cpu`.
+
+`--share-hardware` keeps the existing opt-in behavior and can include the Intel GPU name, rounded total device memory and XPU build version when PyTorch exposes it. It does not send serials, hostnames or paths. Older coordinators may ignore the new optional `xpu` hardware label while accepting the unchanged CPU-delta wire format. The inference-serving path remains CPU-based; selecting XPU accelerates worker training only.
+
 ## Apple Mac (macOS)
 
 MacBook Air/Pro, iMac, Mac mini, Mac Studio and Mac Pro can use the Python worker **when their OS, architecture and PyTorch build are compatible**. Apple silicon uses `--device mps` for Metal GPU training or `--device cpu`. Intel Macs require a compatible x86_64 PyTorch release and can use the CPU route; do not assume a current Apple-silicon wheel, an AMD GPU inside an older Mac, or the newest PyTorch release supports that machine.
@@ -154,7 +182,7 @@ Apple TV and Apple Vision Pro would need separate native UI/runtime/device valid
 
 Each worker's card shows its CPU model, core and thread counts, RAM, GPU model and memory, operating system and PyTorch version, as the worker reports them, plus the speed the coordinator measures. The worker prints exactly what it is sharing when it starts. No hostname, address, serial number or path is sent, and workers appear under an anonymous ID. `--no-share-hardware` keeps the hardware off the list, and the next accepted update removes an earlier report.
 
-These reports come from participants and are not independently verified. The thread count is what PyTorch was given, not the machine's physical cores, and GPU memory is the total, not what is free. The coordinator and network provider necessarily see connection IP addresses.
+These reports come from participants and are not independently verified. The thread count is what PyTorch was given, not the machine's physical cores, and GPU memory is the total, not what is free (on Intel integrated graphics it may be shared system memory). The coordinator and network provider necessarily see connection IP addresses.
 
 ## Tests
 
@@ -165,9 +193,11 @@ python dbmoe.py check-device --device cpu
 python dbmoe.py check-device --device rocm
 # On a compatible Mac after installing macOS PyTorch:
 python dbmoe.py check-device --device mps
+# On a supported Intel machine after installing XPU PyTorch:
+python dbmoe.py check-device --device xpu
 ```
 
-The unit suite covers CPU training, optimizer-state reuse, the update test, coordinator delta validation, portable serialization, CPU/CUDA/ROCm/MPS device selection and privacy behavior. GPU selection is mocked where hardware is absent. Real CUDA/ROCm and MPS tests are explicitly skipped when that backend is unavailable. CPU tests passed on PyTorch 2.6.0+cpu; actual Apple, AMD and NVIDIA hardware validation remains pending.
+The unit suite covers CPU training, optimizer-state reuse, the update test, coordinator delta validation, portable serialization, CPU/CUDA/ROCm/XPU/MPS device selection and privacy behavior. Intel tests also cover missing XPU APIs, invalid GPU indexes, explicit-device failure before credential or network access, and selected-device preflight. GPU selection is mocked where hardware is absent. Real CUDA/ROCm/XPU and MPS tests are explicitly skipped when that backend is unavailable. CPU tests passed on PyTorch 2.6.0+cpu; actual Apple, AMD, Intel and NVIDIA hardware validation remains pending.
 
 ## How it works
 
@@ -227,5 +257,6 @@ The implementation identifies its lineage as OpenTransformers / AGILLM-4, includ
 - https://github.com/Marxist-Leninist/DiffusionBlocks
 
 The related DiffusionBlocks repository declares Apache-2.0. A license for this DBMoE source release has not yet been declared by its owner; public availability does not itself grant a general redistribution license. Dataset licenses and terms are separate and must be checked for any selected data source.
+
 
 

@@ -3,11 +3,11 @@
 
 OpenTransformers / AGILLM-4 lineage (block sigma partition, EDM preconditioning and loss weight ported from
 AGILLM-4 dblocks_train.py) and the recipe of Shing, Koyama and Akiba, "DiffusionBlocks" (ICLR 2026, arXiv:2506.14202).
-One file; workers need only PyTorch (CPU, NVIDIA CUDA, AMD ROCm or macOS MPS).
+One file; workers need only PyTorch (CPU, NVIDIA CUDA, AMD ROCm, Intel XPU or macOS MPS).
 
   coordinator  python dbmoe.py coord --dir RUN --host 127.0.0.1 --port 8790 --tokens tokens.json \
                    --hf "HuggingFaceFW/fineweb-edu:sample/10BT/*.parquet"
-  worker       python dbmoe.py worker [--device cpu|cuda|rocm|mps|auto] [--threads 2] [--steps 40] [--batch 8] [--hours 1] [--no-serve]
+  worker       python dbmoe.py worker [--device cpu|cuda|rocm|xpu|mps|auto] [--threads 2] [--steps 40] [--batch 8] [--hours 1] [--no-serve]
                    (no token needed: the worker enrols itself; --url, --name and --token TOKEN|@FILE remain available)
   sample       python dbmoe.py sample --ckpt RUN/master.pt --prompt "The " [--n 200] [--mode chain|top]
   eval         python dbmoe.py eval --ckpt RUN/master.pt --heldout RUN/heldout.pt
@@ -561,11 +561,12 @@ Join: one command, no account, no token, nobody to ask (Linux or macOS, Python 3
 By hand, also on Windows (use py instead of python3 there, and curl.exe in PowerShell):
   python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu
   curl -fsSL {base}/code -o dbmoe.py
-  python3 dbmoe.py worker [--device cuda|rocm|mps] [--threads 4] [--hours 1]
+  python3 dbmoe.py worker [--device cuda|rocm|xpu|mps] [--threads 4] [--hours 1]
 Want your own token first?  python3 dbmoe.py enrol   (optional; the worker does this by itself)
 Many machines, one identity: python3 dbmoe.py enrol, copy worker.token to each one, run python3 dbmoe.py worker --token @worker.token --name MACHINE
 AMD GPUs need a ROCm build of PyTorch: https://github.com/Marxist-Leninist/dbmoe#amd-gpus-rocm
 Macs: https://github.com/Marxist-Leninist/dbmoe#apple-mac-macos
+Intel GPUs need an XPU build of PyTorch: https://github.com/Marxist-Leninist/dbmoe#intel-gpus-xpu
 The worker gets its own credential by itself, trains one block at a time and serves that block for network inference
 (--no-serve turns serving off).  Every update is tested on held-out text before it is merged.  Ctrl+C stops it.
 Leaving for good: curl -fsSL {base}/leave.sh | sh     (or python3 dbmoe.py leave; takes you off the public list and ends your credential)
@@ -2097,7 +2098,7 @@ def normalize_hardware(value):
         return None
     if value.get('self_reported') is not True:
         return None
-    if not isinstance(value.get('backend'), str) or value['backend'] not in ('cpu', 'cuda', 'rocm', 'mps'):
+    if not isinstance(value.get('backend'), str) or value['backend'] not in ('cpu', 'cuda', 'rocm', 'xpu', 'mps'):
         return None
     out = dict(schema=1, self_reported=True, backend=value['backend'])
     for key in ('cpu_model', 'os', 'cpu_arch', 'torch_version', 'runtime_version', 'gpu_name'):
@@ -2126,13 +2127,27 @@ def worker_hardware(device_info, threads):
                   os=platform.system(), cpu_cores=os.cpu_count() or 1, ram_gib=ram_gib(),
                   cpu_threads=max(1, threads), torch_version=str(torch.__version__),
                   runtime_version=str(torch.version.hip if backend == 'rocm' else
-                                      torch.version.cuda if backend == 'cuda' else platform.mac_ver()[0] if backend == 'mps' else ''))
+                                      torch.version.cuda if backend == 'cuda' else
+                                      (getattr(torch.version, 'xpu', None) or '') if backend == 'xpu' else
+                                      platform.mac_ver()[0] if backend == 'mps' else ''))
     if backend in ('cuda', 'rocm'):
         report['gpu_name'] = device_info['gpu_name']
         report['gpu_memory_gib'] = torch.cuda.get_device_properties(device_info['torch_device']).total_memory / 2**30
+    elif backend == 'xpu':
+        report['gpu_name'] = device_info['gpu_name']
+        report['gpu_memory_gib'] = torch.xpu.get_device_properties(device_info['torch_device']).total_memory / 2**30
     elif backend == 'mps':
         report['gpu_name'] = device_info.get('gpu_name', 'Metal (MPS)')
     return normalize_hardware(report)
+
+
+def xpu_available():
+    """Optional on older/CPU-only PyTorch builds; never require Intel packages for CPU workers."""
+    backend = getattr(torch, 'xpu', None)
+    try:
+        return bool(backend is not None and backend.is_available())
+    except Exception:
+        return False
 
 
 def mps_available():
@@ -2152,7 +2167,7 @@ def resolve_worker_device(requested):
     """
     spec = str(requested).strip().lower()
     if spec == 'auto':
-        spec = 'cuda' if torch.cuda.is_available() else 'mps' if mps_available() else 'cpu'
+        spec = 'cuda' if torch.cuda.is_available() else 'xpu' if xpu_available() else 'mps' if mps_available() else 'cpu'
     if spec == 'cpu':
         return dict(torch_device='cpu', device='cpu', backend='cpu')
     if spec in ('mps', 'mps:0'):
@@ -2165,8 +2180,19 @@ def resolve_worker_device(requested):
                                'Check the supported Mac, macOS and PyTorch versions; see README.md. Use --device cpu explicitly for CPU training.')
         return dict(torch_device='mps', device='mps', backend='mps')
     kind, sep, index = spec.partition(':')
-    if kind not in ('cuda', 'rocm', 'hip') or (sep and (not index.isascii() or not index.isdigit())):
-        raise ValueError('device must be cpu, auto, cuda[:N], rocm[:N], or mps (hip is an alias for rocm)')
+    if kind not in ('cuda', 'rocm', 'hip', 'xpu', 'intel') or (sep and (not index.isascii() or not index.isdigit())):
+        raise ValueError('device must be cpu, auto, cuda[:N], rocm[:N], xpu[:N], or mps '
+                         '(hip aliases rocm; intel aliases xpu)')
+    if kind in ('xpu', 'intel'):
+        if not xpu_available():
+            raise RuntimeError('Intel XPU requested, but PyTorch cannot access an Intel GPU. '
+                               'Install XPU-enabled PyTorch and a supported Intel GPU/OS/driver; see README.md. '
+                               'Use --device cpu explicitly for CPU training.')
+        count = torch.xpu.device_count()
+        idx = int(index) if sep else torch.xpu.current_device()
+        if not 0 <= idx < count:
+            raise ValueError(f'Intel GPU index {idx} is out of range: PyTorch sees {count} XPU device(s)')
+        return dict(torch_device=f'xpu:{idx}', device=f'xpu:{idx}', backend='xpu')
     hip = getattr(torch.version, 'hip', None)
     if kind in ('rocm', 'hip') and not hip:
         raise RuntimeError('AMD ROCm requested, but this PyTorch build has no HIP support. '
@@ -2210,6 +2236,9 @@ def prepare_worker_device(requested, check_cpu=False):
     if info['backend'] in ('cuda', 'rocm'):
         torch.cuda.set_device(device)
         info['gpu_name'] = torch.cuda.get_device_name(device)
+    elif info['backend'] == 'xpu':
+        torch.xpu.set_device(device)
+        info['gpu_name'] = torch.xpu.get_device_name(device)
     elif info['backend'] == 'mps':
         info['gpu_name'] = 'Metal (MPS)'
     if check_cpu or info['backend'] != 'cpu':
@@ -2228,7 +2257,7 @@ def check_device_cmd(a):
     except (ValueError, RuntimeError) as e:
         raise SystemExit(f'[check-device] {e}') from e
     print(json.dumps(dict(ok=True, torch_version=torch.__version__, hip_version=torch.version.hip,
-                          cuda_version=torch.version.cuda, **info), indent=2))
+                          cuda_version=torch.version.cuda, xpu_version=getattr(torch.version, 'xpu', None), **info), indent=2))
 
 
 def token_path(base):
@@ -2461,7 +2490,7 @@ def train_lease(L, device, opt_cache=None):
     data = L['data'].long().to(device)
     S, bs = L['steps'], L['batch']
     settle = min(8, S // 4) if warm else 0              # a new Adam first watches a few steps at lr 0, so its first real steps are not sign-sized jolts
-    ces, t0 = [], time.time()
+    ces, t0 = [], time.perf_counter()
     for s in range(S):
         for g in opt.param_groups:
             g['lr'] = L['lr'] * (0.0 if s < settle else min(1.0, (s + 1 - settle) / warm) if warm else 1.0)
@@ -2472,13 +2501,14 @@ def train_lease(L, device, opt_cache=None):
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         ces.append(round(float(ce), 4))
-    sec = time.time() - t0
+    sec = time.perf_counter() - t0
     if opt_cache is not None:
         opt_cache.pop(b, None)
         opt_cache[b] = (opt.state_dict(), L.get('block_version', 0) + 1)
         while len(opt_cache) > 2:                          # keep the two most recent blocks
             opt_cache.pop(next(iter(opt_cache)))
-    return dict(lease=L['lease'], block=b, losses=ces, seconds=round(sec, 2), tokens=int(S * bs * cfg['ctx']),
+    # Keep the reported 10ms resolution positive for tiny/fast leases; zero is invalid wire metadata.
+    return dict(lease=L['lease'], block=b, losses=ces, seconds=max(0.01, round(sec, 2)), tokens=int(S * bs * cfg['ctx']),
                 fresh_optimizer=bool(warm),
                 d_shared={k: (v.detach().float().cpu() - s0[k].float().cpu()) for k, v in shared.state_dict().items()},
                 d_block={k: (v.detach().float().cpu() - b0[k].float().cpu()) for k, v in block.state_dict().items()})
@@ -2622,10 +2652,10 @@ def main():
     w.add_argument('--share-hardware', action='store_true', help=argparse.SUPPRESS)    # the default now; accepted for older commands
     w.add_argument('--no-serve', action='store_true', help='train only: do not serve a block for network inference')
     w.add_argument('--serve-only', action='store_true', help='serve network inference only: no training')
-    w.add_argument('--device', default='cpu', help='cpu (default), auto, cuda[:N], rocm[:N] for AMD, or mps for Mac; '
+    w.add_argument('--device', default='cpu', help='cpu (default), auto, cuda[:N], rocm[:N] for AMD, xpu[:N] for Intel, or mps for Mac; '
                    'explicit GPU requests fail if unavailable, rather than falling back to CPU')
     d = sp.add_parser('check-device', help='offline tiny training and serialization test; no token or network')
-    d.add_argument('--device', default='cpu', help='cpu, auto, cuda[:N], rocm[:N], or mps')
+    d.add_argument('--device', default='cpu', help='cpu, auto, cuda[:N], rocm[:N], xpu[:N] (intel alias), or mps')
     d.add_argument('--threads', type=int, default=2)
     w.add_argument('--threads', type=int, default=2)
     w.add_argument('--steps', type=int, default=0, help='steps per lease (0 = coordinator default)')
@@ -2653,3 +2683,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

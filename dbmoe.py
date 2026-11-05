@@ -2205,7 +2205,7 @@ def train_lease(L, device, opt_cache=None):
     data = L['data'].long().to(device)
     S, bs = L['steps'], L['batch']
     settle = min(8, S // 4) if warm else 0              # a new Adam first watches a few steps at lr 0, so its first real steps are not sign-sized jolts
-    ces, t0 = [], time.time()
+    ces, t0 = [], time.perf_counter()
     for s in range(S):
         for g in opt.param_groups:
             g['lr'] = L['lr'] * (0.0 if s < settle else min(1.0, (s + 1 - settle) / warm) if warm else 1.0)
@@ -2216,13 +2216,14 @@ def train_lease(L, device, opt_cache=None):
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         ces.append(round(float(ce), 4))
-    sec = time.time() - t0
+    sec = time.perf_counter() - t0
     if opt_cache is not None:
         opt_cache.pop(b, None)
         opt_cache[b] = (opt.state_dict(), L.get('block_version', 0) + 1)
         while len(opt_cache) > 1:                          # sticky block: one optimizer state is enough and saves RAM
             opt_cache.pop(next(iter(opt_cache)))
-    return dict(lease=L['lease'], block=b, losses=ces, seconds=round(sec, 2), tokens=int(S * bs * cfg['ctx']),
+    # Keep the reported 10ms resolution positive for tiny/fast leases; zero is invalid wire metadata.
+    return dict(lease=L['lease'], block=b, losses=ces, seconds=max(0.01, round(sec, 2)), tokens=int(S * bs * cfg['ctx']),
                 fresh_optimizer=bool(warm),
                 d_shared={k: (v.detach().float().cpu() - s0[k].float().cpu()) for k, v in shared.state_dict().items()},
                 d_block={k: (v.detach().float().cpu() - b0[k].float().cpu()) for k, v in block.state_dict().items()})

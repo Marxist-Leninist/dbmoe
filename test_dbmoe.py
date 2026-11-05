@@ -117,6 +117,15 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(len(losses), 2)
         self.assertTrue(all(math.isfinite(v) for v in losses))
 
+    def test_sub_centisecond_lease_reports_positive_duration(self):
+        L = tiny_lease()
+        with mock.patch.object(dbmoe.time, 'perf_counter', side_effect=[100., 100.001]):
+            up = dbmoe.from_bytes(dbmoe.to_bytes(dbmoe.train_lease(L, 'cpu')))
+        self.assertEqual(up['seconds'], .01)
+        C = dbmoe.Coordinator.__new__(dbmoe.Coordinator)
+        C.lr, C.model = L['lr'], dbmoe.Model(L['cfg'])
+        self.assertIsNone(C._check(up, L))
+
     def test_cpu_train_delta_format_cache_and_coordinator_validation(self):
         torch.manual_seed(123)
         L = tiny_lease()

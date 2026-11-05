@@ -45,7 +45,7 @@ The worker trains and can serve an inference block. This uses your machine's com
 
 **Release synchronization:** the live worker at `/dbmoe/code` and this repository now carry the same v4 protocol: anonymous joining, lease/learning gates, bounded downloads, split block/shared-round validation, and measured `chain`/`top` sampling. CPU, NVIDIA CUDA, AMD ROCm and Apple MPS code paths are included. Physical AMD and Apple-hardware validation remains pending; no capability claim is made for those devices yet.
 
-In this repository, `--device cpu` remains the default; `cuda` selects NVIDIA, `rocm` selects a supported AMD GPU, and `mps` selects a compatible Mac GPU. `auto` explicitly opts into CUDA/ROCm first, then MPS, otherwise CPU. Explicit GPU requests fail early when unavailable. These backend extensions still need integration into the deployed anonymous worker.
+In this repository, `--device cpu` remains the default; `cuda` selects NVIDIA, `rocm` selects a supported AMD GPU, and `mps` selects a compatible Mac GPU. `auto` explicitly opts into CUDA/ROCm first, then MPS, otherwise CPU. Explicit GPU requests fail early when unavailable. Physical backend validation is a separate gate and remains pending on AMD and Apple hardware.
 
 
 ## AMD GPUs (ROCm)
@@ -118,7 +118,7 @@ Apple TV and Apple Vision Pro would need separate native UI/runtime/device valid
 
 ## Optional public hardware specs
 
-Once the hardware extension is present in the deployed worker, add `--share-hardware` to opt in to publishing self-reported hardware details with your worker statistics: GPU model and rounded total GPU memory, CPU architecture, the number of PyTorch CPU threads assigned to this worker, PyTorch version, and CUDA/ROCm runtime version (macOS version for MPS). MPS reports a generic Metal name and no VRAM figure. Thread count is not the machine's physical core count; GPU memory is not free memory. These reports are supplied by participants, not independently verified inventory.
+With `--share-hardware` present in the deployed worker, add it to opt in to publishing self-reported hardware details with your worker statistics: GPU model and rounded total GPU memory, CPU architecture, the number of PyTorch CPU threads assigned to this worker, PyTorch version, and CUDA/ROCm runtime version (macOS version for MPS). MPS reports a generic Metal name and no VRAM figure. Thread count is not the machine's physical core count; GPU memory is not free memory. These reports are supplied by participants, not independently verified inventory.
 
 Without this flag, no detailed hardware report is sent. Device/backend and participation statistics are still sent as before. New workers do not transmit machine hostnames, IP fields, serial numbers or local paths in update payloads; the coordinator/network provider necessarily sees connection IPs. Choose an explicit public pseudonym, or omit `--name` for a random worker label. The coordinator strips legacy host/IP fields from public status and accepts only the documented hardware fields. Restart without the flag to withdraw the report on the next accepted update; prior logs/backups may still retain earlier reports. Older coordinators may ignore this optional metadata, and website display requires coordinator/page support.
 

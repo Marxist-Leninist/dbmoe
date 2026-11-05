@@ -55,7 +55,8 @@ class OneTokenManyMachines(unittest.TestCase):
                     r = subprocess.run([sys.executable, script, 'enrol', '--url', url, '--token-file', str(path)],
                                        capture_output=True, text=True, timeout=60)
                     self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                    if sys.platform != 'win32':     # Windows has no POSIX permission bits; chmod only toggles read-only
+                        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
                     token = path.read_text().strip()
                     self.assertNotIn(token, r.stdout + r.stderr)
                     # machines of one network start at the same moment

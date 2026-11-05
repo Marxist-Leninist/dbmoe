@@ -13,6 +13,21 @@ GENERATOR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(GENERATOR)
 
 
+# Inputs regenerated here from fixed seeds (initial weights, noise) differ from the stored fixture in the last
+# float32 digits on other CPUs and operating systems (x86 vs Apple Silicon, vectorized libm), so compare them
+# within a tolerance instead of exactly; the outputs below keep their own tolerance.
+INPUT_TOL = dict(rtol=1e-4, atol=1e-5)
+
+
+def assert_tensor_close(case, ref, got, name):
+    if ref is None:
+        case.assertIsNone(got, name)
+        return
+    case.assertEqual(ref['shape'], got['shape'], name)
+    case.assertEqual(ref['dtype'], got['dtype'], name)
+    torch.testing.assert_close(torch.tensor(ref['data']), torch.tensor(got['data']), msg=name, **INPUT_TOL)
+
+
 class NativeNumericalReferenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -25,8 +40,8 @@ class NativeNumericalReferenceTests(unittest.TestCase):
 
     def test_fixture_has_explicit_noise_and_both_experts(self):
         self.assertEqual(self.fixture['batch'], self.actual['batch'])
-        self.assertEqual(self.fixture['sigma'], self.actual['sigma'])
-        self.assertEqual(self.fixture['epsilon'], self.actual['epsilon'])
+        for name in ('sigma', 'epsilon'):
+            assert_tensor_close(self, self.fixture[name], self.actual[name], name)
         self.assertEqual(self.fixture['cfg'], self.actual['cfg'])
         self.assertEqual(self.fixture['expected']['expert_fractions'][0]['data'], [.5, .5])
 
@@ -34,8 +49,9 @@ class NativeNumericalReferenceTests(unittest.TestCase):
         expected, actual = self.fixture['expected'], self.actual['expected']
         for name in ('loss', 'ce', 'auxiliary', 'gradient_norm_before_clip'):
             self.assertTrue(math.isclose(expected[name], actual[name], rel_tol=1e-5, abs_tol=1e-6), name)
-        for section in ('initial',):
-            self.assertEqual(self.fixture[section], self.actual[section])
+        self.assertEqual(set(self.fixture['initial']), set(self.actual['initial']))
+        for name, ref in self.fixture['initial'].items():
+            assert_tensor_close(self, ref, self.actual['initial'][name], 'initial: ' + name)
         for section in ('gradients', 'clipped_gradients', 'after_step', 'deltas'):
             self.assertEqual(set(expected[section]), set(actual[section]))
             for name, ref in expected[section].items():

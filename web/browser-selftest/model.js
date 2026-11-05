@@ -89,29 +89,40 @@ export function createModel(tf, lease, memoryMiB) {
   }
   const optimizer={};let step=0;
   async function trainStep(dataValues,sigmaValues=null,epsilonValues=null) {
-    const B=lease.batch,T=c.ctx,d=c.d,lo=lease.sigmas[lease.block],hi=lease.sigmas[lease.block+1];
+    const B=lease.batch,T=c.ctx,d=c.d,lo=lease.sigmas[lease.block],hi=lease.sigmas[lease.block+1],n=step+1;
     const result=tf.tidy(()=>{
       const x=tf.tensor2d(dataValues,[B,T+1],'int32');
       const sigma=sigmaValues?tf.tensor1d(sigmaValues):tf.exp(tf.randomUniform([B],Math.log(lo),Math.log(hi)));
       const eps=epsilonValues?tf.tensor(epsilonValues,[B,T,d]):tf.randomNormal([B,T,d]);
       let ce;
       const {value,grads}=tf.variableGrads(()=>{const r=objective(x,sigma,eps);ce=tf.keep(r.ce);return r.loss;},Object.values(vars));
-      const norm=tf.sqrt(tf.addN(Object.values(grads).map(g=>tf.sum(g.square()))));
-      const clip=tf.minimum(tf.scalar(1).div(norm.add(1e-6)),1),lr=lease.lr*Math.min(1,(step+1)/10),n=step+1;
-      for(const [key,p]of Object.entries(vars)){
-        const g=grads[p.name].mul(clip),old=optimizer[key];
-        const m=(old?old.m.mul(.9):tf.zerosLike(p)).add(g.mul(.1));
-        const vv=(old?old.v.mul(.95):tf.zerosLike(p)).add(g.square().mul(.05));
-        const change=m.div(1-Math.pow(.9,n)).div(tf.sqrt(vv.div(1-Math.pow(.95,n))).add(1e-8)).mul(lr);
-        p.assign(p.mul(1-lr*(p.rank>=2?.01:0)).sub(change));
-        if(old){old.m.dispose();old.v.dispose();}optimizer[key]={m:tf.keep(m),v:tf.keep(vv)};
-      }
-      return {loss:value,ce,norm};
+      return {value,ce,grads};
     });
-    step++;
-    const values=await Promise.all([result.loss.data(),result.ce.data(),result.norm.data()]);Object.values(result).forEach(t=>t.dispose());
-    if(!values.every(a=>Number.isFinite(a[0])))throw Error('Non-finite training result; update discarded');
-    return {loss:values[0][0],ce:values[1][0],gradientNorm:values[2][0],step};
+    try {
+      // Objective gradients stay on the selected backend; AdamW uses checked JavaScript arithmetic for portable finite updates.
+      const entries=Object.entries(result.grads),arrays=await Promise.all(entries.map(([,g])=>g.data()));
+      if(!arrays.every(a=>a.every(Number.isFinite)))throw Error('Non-finite gradient; update discarded');
+      const norm=Math.sqrt(arrays.reduce((total,a)=>total+a.reduce((s,x)=>s+x*x,0),0));
+      const clip=Math.min(1/(norm+1e-6),1),lr=lease.lr*Math.min(1,n/10);
+      for(let i=0;i<entries.length;i++){
+        const key=entries[i][0],p=vars[key],g=arrays[i],old=optimizer[key];
+        const m=new Float32Array(p.size),vv=new Float32Array(p.size),current=await p.data();
+        for(let j=0;j<p.size;j++){
+          const grad=g[j]*clip,oldM=old?old.m[j]:0,oldV=old?old.v[j]:0;
+          m[j]=oldM*.9+grad*.1;vv[j]=oldV*.95+grad*grad*.05;
+          const change=(m[j]/(1-Math.pow(.9,n)))/(Math.sqrt(vv[j]/(1-Math.pow(.95,n)))+1e-8)*lr;
+          current[j]=current[j]*(1-lr*(p.rank>=2?.01:0))-change;
+        }
+        const updated=tf.tensor(current,p.shape,'float32');p.assign(updated);updated.dispose();
+        optimizer[key]={m,v:vv};
+      }
+      const values=await Promise.all([result.value.data(),result.ce.data()]);
+      if(!values.every(a=>Number.isFinite(a[0])))throw Error('Non-finite training result; update discarded');
+      step++;
+      return {loss:values[0][0],ce:values[1][0],gradientNorm:norm,step};
+    } finally {
+      result.value.dispose();result.ce.dispose();Object.values(result.grads).forEach(g=>g.dispose());
+    }
   }
   async function delta() {
     const output={d_shared:{},d_block:{}};
@@ -122,6 +133,6 @@ export function createModel(tf, lease, memoryMiB) {
     }
     return output;
   }
-  function dispose(){Object.values(vars).forEach(p=>p.dispose());Object.values(optimizer).forEach(o=>{o.m.dispose();o.v.dispose();});}
+  function dispose(){Object.values(vars).forEach(p=>p.dispose());for(const key of Object.keys(optimizer))delete optimizer[key];}
   return {vars,objective,trainStep,delta,dispose};
 }

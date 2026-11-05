@@ -41,7 +41,9 @@ the current noise level, exactly as in training.  `--mode top` instead samples f
 NETWORK.  HTTP + bearer token.  GET lease -> {lease, block, cfg, sigmas, shared, block_state, data, steps, batch, lr};
 POST update <- {lease, block, d_block, d_shared, losses, tokens, seconds}.  Payloads are torch.save dicts of
 tensors and plain values and are always loaded with weights_only=True (no pickle code execution).  Each update is
-checked (keys, shapes, finite, |delta| <= 3.5*lr*steps, the Adam bound) before it is merged.  Merging is
+checked (keys, shapes, finite, |delta| <= 3.5*lr*steps, the Adam bound) before it is merged.  Workers without PyTorch
+(worker-rs/, the Rust worker) opt into safetensors instead: GET lease?fmt=safetensors, and POST update with
+Content-Type application/vnd.dbmoe.update+safetensors; the same fields and the same checks.  Merging is
 asynchronous delta averaging: block += d_block / (leases that overlapped on that block).  Shared parameters define the
 target every block denoises toward, so they move in rounds: deltas are banked per block and applied together every 12
 updates, weighted by what each block still has to learn, so all blocks see one stable embedding between rounds.  Workers
@@ -62,7 +64,7 @@ byte's logits.  A slow or vanished worker's hop is rerouted; if no worker has a 
 and the reply says so.  Results are spot-checked against the snapshot and workers that lie stop being used.  The reply is
 a stream of JSON lines naming the (anonymous) worker behind every hop.
 """
-import argparse, array, base64, collections, hashlib, hmac, http.client as httpc, io, ipaddress, json, math, os, platform, random, re, secrets, select, socket, sys, threading, time, urllib.error, urllib.parse, urllib.request
+import argparse, array, base64, collections, ctypes, hashlib, hmac, http.client as httpc, io, ipaddress, json, math, os, platform, random, re, secrets, select, socket, struct, sys, threading, time, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
@@ -437,6 +439,121 @@ def to_bytes(obj):
 
 def from_bytes(b):
     return torch.load(io.BytesIO(b), map_location='cpu', weights_only=True)
+
+
+# Opt-in safetensors wire format, for workers without PyTorch (worker-rs).  A lease or an update is one safetensors file:
+# its tensors in the tensor section, every other field as JSON in one metadata entry.  No pickle and no numpy.
+ST_DTYPES = {'F64': torch.float64, 'F32': torch.float32, 'F16': torch.float16, 'BF16': torch.bfloat16, 'I64': torch.int64,
+             'I32': torch.int32, 'I16': torch.int16, 'I8': torch.int8, 'U8': torch.uint8}
+ST_NAMES = {v: k for k, v in ST_DTYPES.items()}
+ST_LEASE_TYPE = 'application/vnd.dbmoe.lease+safetensors'
+ST_UPDATE_TYPE = 'application/vnd.dbmoe.update+safetensors'
+
+
+def st_dumps(tensors, metadata=None):
+    """safetensors bytes: an 8-byte little-endian header length, the JSON header padded to 8 bytes, then each tensor's
+    raw little-endian bytes in name order."""
+    if sys.byteorder != 'little':
+        raise RuntimeError('the safetensors wire format needs a little-endian machine')
+    header, chunks, off = {}, [], 0
+    if metadata:
+        header['__metadata__'] = {str(k): str(v) for k, v in metadata.items()}
+    for name in sorted(tensors):
+        t = tensors[name].detach().to('cpu').contiguous()
+        if name == '__metadata__' or t.dtype not in ST_NAMES:
+            raise ValueError(f'safetensors: cannot store {name!r} ({t.dtype})')
+        n = t.numel() * t.element_size()
+        chunks.append(ctypes.string_at(t.data_ptr(), n) if n else b'')
+        header[name] = dict(dtype=ST_NAMES[t.dtype], shape=list(t.shape), data_offsets=[off, off + n])
+        off += n
+    h = json.dumps(header, separators=(',', ':')).encode()
+    h += b' ' * (-len(h) % 8)
+    return struct.pack('<Q', len(h)) + h + b''.join(chunks)
+
+
+def st_loads(buf, max_header=1 << 20, max_tensors=4096):
+    """Parse safetensors bytes strictly: known dtypes, byte sizes that match the shapes, offsets that tile the data
+    section exactly, no duplicate names, at most max_tensors tensors, string metadata.  The whole layout is checked
+    before any tensor is built, so the tensors never take more memory than the data section itself (an update has
+    a few dozen tensors and a header of a few KB).  Raises ValueError otherwise."""
+    if sys.byteorder != 'little':
+        raise RuntimeError('the safetensors wire format needs a little-endian machine')
+    buf = memoryview(buf)
+    if len(buf) < 8:
+        raise ValueError('safetensors: too short')
+    (n,) = struct.unpack('<Q', buf[:8])
+    if n > min(max_header, len(buf) - 8):
+        raise ValueError('safetensors: bad header length')
+
+    def unique(pairs):
+        d = {}
+        for k, v in pairs:
+            if k in d:
+                raise ValueError(f'safetensors: duplicate key {k!r}')
+            d[k] = v
+        return d
+    try:
+        header = json.loads(bytes(buf[8:8 + n]).decode('utf-8'), object_pairs_hook=unique)
+    except UnicodeDecodeError as e:
+        raise ValueError(f'safetensors: header is not UTF-8: {e}') from None
+    if not isinstance(header, dict):
+        raise ValueError('safetensors: header is not an object')
+    meta = header.pop('__metadata__', None) or {}
+    if not isinstance(meta, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in meta.items()):
+        raise ValueError('safetensors: metadata must map strings to strings')
+    if len(header) > max_tensors:
+        raise ValueError(f'safetensors: more than {max_tensors} tensors')
+    data, entries = buf[8 + n:], []
+    for name, e in header.items():                      # first pass: validate only, copy nothing
+        if not isinstance(e, dict) or set(e) != {'dtype', 'shape', 'data_offsets'} or e['dtype'] not in ST_DTYPES:
+            raise ValueError(f'safetensors: bad entry for {name!r}')
+        shape, offs = e['shape'], e['data_offsets']
+        if not isinstance(shape, list) or len(shape) > 8 or not all(type(s) is int and s >= 0 for s in shape):
+            raise ValueError(f'safetensors: bad shape for {name!r}')
+        if (not isinstance(offs, list) or len(offs) != 2 or not all(type(o) is int for o in offs)
+                or not 0 <= offs[0] <= offs[1] <= len(data)):
+            raise ValueError(f'safetensors: bad data_offsets for {name!r}')
+        dt = ST_DTYPES[e['dtype']]
+        if math.prod(shape) * torch.empty((), dtype=dt).element_size() != offs[1] - offs[0]:
+            raise ValueError(f'safetensors: the size of {name!r} does not match its shape')
+        entries.append((offs[0], offs[1], name, dt, shape))
+    pos = 0
+    for a, b, *_ in sorted(entries, key=lambda x: (x[0], x[1])):
+        if a != pos:
+            raise ValueError('safetensors: tensor data has gaps or overlaps')
+        pos = b
+    if pos != len(data):
+        raise ValueError('safetensors: trailing bytes after the last tensor')
+    out = {}                                            # second pass: the spans tile the data, so this copies it once
+    for a, b, name, dt, shape in entries:
+        out[name] = torch.frombuffer(bytearray(data[a:b]), dtype=dt).reshape(shape) if b > a else torch.empty(shape, dtype=dt)
+    return out, meta
+
+
+def lease_to_safetensors(L):
+    """A lease as safetensors: tensors shared.*, block.* and data; every other field as JSON in 'dbmoe.lease'."""
+    tensors = {f'shared.{k}': v for k, v in L['shared'].items()}
+    tensors.update({f'block.{k}': v for k, v in L['block_state'].items()})
+    tensors['data'] = L['data']
+    meta = {k: v for k, v in L.items() if k not in ('shared', 'block_state', 'data')}
+    return st_dumps(tensors, {'dbmoe.lease': json.dumps(meta, allow_nan=False)})
+
+
+def update_from_safetensors(body):
+    """The update dict from a safetensors upload: d_shared.* and d_block.* tensors plus the fields in 'dbmoe.update'.
+    It then goes through exactly the checks a torch.save upload does."""
+    tensors, meta = st_loads(body)
+    up = json.loads(meta.get('dbmoe.update', 'null'))
+    if not isinstance(up, dict):
+        raise ValueError("safetensors update: no 'dbmoe.update' metadata")
+    up = {k: v for k, v in up.items() if k not in ('d_shared', 'd_block')}
+    up['d_shared'], up['d_block'] = {}, {}
+    for name, t in tensors.items():
+        group, _, key = name.partition('.')
+        if group not in ('d_shared', 'd_block') or not key:
+            raise ValueError(f'safetensors update: unexpected tensor {name!r}')
+        up[group][key] = t
+    return up
 
 
 def encode(text):
@@ -2062,8 +2179,10 @@ def serve(a):
                     if why:
                         return self._send(403, dict(error=why))
                     name = f"{who}/{q.get('name', 'worker')[:40]}"
-                    body = to_bytes(C.lease(name, int(q.get('steps') or 0), int(q.get('batch') or 0), q.get('session', '')[:32], owner=who, client=self._client()))
-                    return self._send(200, body, 'application/octet-stream')
+                    lease = C.lease(name, int(q.get('steps') or 0), int(q.get('batch') or 0), q.get('session', '')[:32], owner=who, client=self._client())
+                    if q.get('fmt') == 'safetensors':           # opt-in, for workers without PyTorch
+                        return self._send(200, lease_to_safetensors(lease), ST_LEASE_TYPE)
+                    return self._send(200, to_bytes(lease), 'application/octet-stream')
                 if p in ('', 'dbmoe', 'index.html'):
                     s = C.status()
                     ev = s['last_eval'] or {}
@@ -2132,7 +2251,8 @@ def serve(a):
                     if not chunk:
                         return self._reject(400, 'incomplete body')
                     body.extend(chunk)
-                up = from_bytes(body)
+                ctype = (self.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+                up = update_from_safetensors(body) if ctype == ST_UPDATE_TYPE else from_bytes(body)
                 if not isinstance(up, dict):
                     return self._reject(400, 'bad payload')
                 name = up.get('name', 'worker')

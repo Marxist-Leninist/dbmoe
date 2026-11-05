@@ -172,6 +172,7 @@ pub async fn train_lease(lease: &Lease, device: &Device, cache: &mut OptCache, r
         let rows = &lease.data[s * bs * t1..(s + 1) * bs * t1];
         let batch = Batch { ids: rows.iter().map(|&x| x as usize).collect(), b: bs, t1, sigma: sample_sigma(cfg, lo, hi, bs, rng) };
         batch.validate(cfg)?;
+        // Draw sigma and Gaussian noise from the worker's seeded stream, never Burn's separate backend RNG.
         let eps = Tensor::<3>::from_data(
             TensorData::new(rng.standard_normals(bs * (t1 - 1) * cfg.d), [bs, t1 - 1, cfg.d]),
             device,

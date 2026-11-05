@@ -289,5 +289,6 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('route:selectedRoute', html)
         self.assertIn('auto_calibration', html)
         self.assertIn('one checkpoint snapshot', html)
+        self.assertIn('--device cuda|rocm|xpu|mps', html)
 
 if __name__ == '__main__': unittest.main(verbosity=2)

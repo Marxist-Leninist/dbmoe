@@ -1,0 +1,29 @@
+[
+  {
+    "package": "@tensorflow/tfjs",
+    "url": "https://registry.npmjs.org/@tensorflow/tfjs/-/tfjs-4.22.0.tgz",
+    "integrity": "sha512-0TrIrXs6/b7FLhLVNmfh8Sah6JgjBPH4mZ8JGb7NU6WW+cx00qK5BcAZxw7NCzxj6N8MRAIfHq+oNbPUNG5VAg==",
+    "files": [
+      "tf.min.js"
+    ]
+  },
+  {
+    "package": "@tensorflow/tfjs-backend-webgpu",
+    "url": "https://registry.npmjs.org/@tensorflow/tfjs-backend-webgpu/-/tfjs-backend-webgpu-4.22.0.tgz",
+    "integrity": "sha512-lvIc7Af4Tl2BCdYp43iQmSCRq3asaKT0q2xaErphXiUZ+jqeB0bQa0ZvQys1Xatvto0U4/c90DVsHPfvkn5ftg==",
+    "files": [
+      "tf-backend-webgpu.min.js"
+    ]
+  },
+  {
+    "package": "@tensorflow/tfjs-backend-wasm",
+    "url": "https://registry.npmjs.org/@tensorflow/tfjs-backend-wasm/-/tfjs-backend-wasm-4.22.0.tgz",
+    "integrity": "sha512-/IYhReRIp4jg/wYW0OwbbJZG8ON87mbz0PgkiP3CdcACRSvUN0h8rvC0O3YcDtkTQtFWF/tcXq/KlVDyV49wmA==",
+    "files": [
+      "tf-backend-wasm.min.js",
+      "tfjs-backend-wasm.wasm",
+      "tfjs-backend-wasm-simd.wasm",
+      "tfjs-backend-wasm-threaded-simd.wasm"
+    ]
+  }
+]

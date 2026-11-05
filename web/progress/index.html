@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>AGILLM · Distributed training progress</title>
+<style>
+:root{color-scheme:dark;--bg:#080e14;--panel:#111c27;--line:#243342;--muted:#a6b5c4;--text:#edf4fa;--accent:#86e9bc;--blue:#8ebfff}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 system-ui,sans-serif}main{max-width:1160px;margin:auto;padding:36px 24px 56px}header{display:flex;justify-content:space-between;gap:20px;align-items:center;border-bottom:1px solid var(--line);padding-bottom:22px}.brand{font-weight:800;letter-spacing:.09em}.brand span{color:var(--accent)}.pill{font-size:13px;border:1px solid var(--line);border-radius:30px;padding:6px 12px;color:var(--muted)}.hero{padding:48px 0 28px;max-width:850px}.eyebrow{color:var(--accent);font-size:12px;letter-spacing:.15em;font-weight:700;text-transform:uppercase}h1{font-size:clamp(32px,5vw,54px);line-height:1.1;letter-spacing:-.04em;margin:12px 0 20px}h2{font-size:19px;margin:0 0 8px}p{margin:8px 0;color:var(--muted)}a{color:var(--accent);text-underline-offset:4px}button{background:var(--accent);border:0;color:#092015;border-radius:8px;padding:10px 16px;cursor:pointer;font:inherit;font-weight:700}button:disabled{opacity:.55;cursor:wait}button:focus-visible,a:focus-visible{outline:3px solid var(--blue);outline-offset:5px}.livebar{display:flex;gap:16px;align-items:center;justify-content:space-between;margin:4px 0 22px;font-size:13px}.livebar p{margin:0}#connection{color:var(--accent)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.metric,.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px}.metric strong{display:block;font-size:clamp(25px,3vw,36px);line-height:1.3;font-variant-numeric:tabular-nums;margin:8px 0}.label{font-size:13px;color:var(--muted)}.small{font-size:12px;color:var(--muted)}.columns{display:grid;grid-template-columns:1.1fr 1fr;gap:18px;margin-top:18px}.barrow{margin:17px 0}.barlabel{display:flex;justify-content:space-between;gap:10px;font-size:13px;margin-bottom:7px}.track{height:9px;background:#243342;border-radius:8px;overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:8px}.chart{height:170px;display:flex;align-items:center;justify-content:center;margin-top:16px}.chart svg{width:100%;height:100%;overflow:visible}.evals{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:var(--muted)}.note{border-left:3px solid var(--blue);padding:0 0 0 14px;font-size:14px;margin-top:22px}.join{margin-top:18px;display:grid;grid-template-columns:.9fr 1.3fr;gap:28px}.join ol{padding-left:20px;color:var(--muted)}pre{background:#080e14;border:1px solid var(--line);padding:16px;border-radius:9px;overflow:auto;font-size:12px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere}code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.metadata{display:flex;flex-wrap:wrap;gap:8px;margin:15px 0}.metadata span{border:1px solid var(--line);padding:4px 10px;border-radius:5px;font-size:12px;color:var(--muted)}footer{margin-top:28px;border-top:1px solid var(--line);padding-top:20px;color:var(--muted);font-size:12px}.warn{color:#ffca84!important}#error{color:#ffca84;min-height:1px}.sample{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.7 ui-monospace,monospace;color:#d1e0ec;margin:15px 0 0}details{margin-top:18px}summary{cursor:pointer;color:var(--blue)}@media(max-width:760px){main{padding:22px 16px}.hero{padding:32px 0 22px}.metrics{grid-template-columns:repeat(2,1fr)}.columns,.join{grid-template-columns:1fr}.metric,.card{padding:18px}.livebar{align-items:flex-start}.pill{font-size:11px}header{gap:8px}.brand{font-size:14px}}@media(prefers-reduced-motion:no-preference){.fill{transition:width .4s ease}}
+</style></head><body><main>
+<header><div class="brand">AGILLM <span>/ NETWORK</span></div><span class="pill">Experimental training pilot</span></header>
+<nav class="small" aria-label="DBMoE pages"><a href="/dbmoe/browser-selftest/">Test this browser</a> · <a href="/dbmoe/">Native worker setup</a> · <a href="https://github.com/Marxist-Leninist/dbmoe" rel="noopener noreferrer">Source code</a></nav>
+<section class="hero"><div class="eyebrow">DiffusionBlocks · Mixture of Experts</div><h1>Many computers.<br>One shared experiment.</h1><p>Computers anywhere train separate blocks of one model and run it together. Join with one command, or try it below.</p><p class="note">This is the small byte-level pilot, not the 512B model.</p></section>
+<div class="livebar"><div><p id="connection" role="status" aria-live="polite">Connecting to live metrics…</p><p id="updated">Refreshes every 15 seconds while this page is visible.</p></div><button id="refresh" type="button">Refresh</button></div><p id="error" role="alert"></p>
+<section class="metrics" aria-label="Training totals"><div class="metric"><span class="label">Accepted updates</span><strong id="updates">—</strong><span class="small">Passed the test and merged</span></div><div class="metric"><span class="label">Training bytes processed</span><strong id="bytes">—</strong><span class="small">Bytes of text trained on</span></div><div class="metric"><span class="label">Workers training now</span><strong id="workers">—</strong><span class="small">Have a job right now</span></div><div class="metric"><span class="label">Latest held-out bits / byte</span><strong id="bpb">—</strong><span class="small">Top block on text no worker sees · lower is better</span></div></section>
+<section class='card' style='margin-top:18px' aria-label='Accepted training and reference targets' id='tgSection'><div class='eyebrow'>Training · whole network</div><h2 style='margin-top:8px'>Bytes trained on</h2><strong id='tgDone' style='display:block;font-size:clamp(28px,4vw,40px);line-height:1.25;font-variant-numeric:tabular-nums;margin:6px 0'>—</strong><p id='tgRate' class='small'>Measuring the network rate…</p><div class='barrow'><div class='barlabel'><span id='tgCLabel'>Chinchilla: 20 × parameters</span><span id='tgCPct'>—</span></div><div class='track'><div class='fill' id='tgCBar' style='width:0%'></div></div><p class='small' id='tgCLeft'>—</p></div><div class='barrow'><div class='barlabel'><span>500 billion bytes</span><span id='tg5Pct'>—</span></div><div class='track'><div class='fill' id='tg5Bar' style='width:0%;background:var(--blue)'></div></div><p class='small' id='tg5Left'>—</p></div><div class='barrow'><div class='barlabel'><span>1 trillion bytes</span><span id='tg1Pct'>—</span></div><div class='track'><div class='fill' id='tg1Bar' style='width:0%;background:#c9a7ff'></div></div><p class='small' id='tg1Left'>—</p></div><p class='small' id='tgNote'>Only bytes from updates that passed the test count, and text can repeat.</p><script>(()=>{'use strict';const el=id=>document.getElementById(id),nf=new Intl.NumberFormat('en-GB');const short=n=>{const a=Math.abs(n);for(const [v,u] of [[1e12,' T'],[1e9,' B'],[1e6,' M'],[1e3,' K']]){if(a>=v){const x=n/v;return String(+x.toFixed(x>=100?0:x>=10?1:2))+u}}return nf.format(Math.round(n))};const pct=x=>x>=100?x.toFixed(0)+'%':x>=10?x.toFixed(1)+'%':x>=1?x.toFixed(2)+'%':x>=0.01?x.toFixed(3)+'%':x>0?x.toPrecision(2)+'%':'0%';const dur=s=>{if(!Number.isFinite(s)||s<=0)return null;const m=s/60,h=m/60,d=h/24,y=d/365.25;if(y>=2)return y.toFixed(1)+' years';if(d>=60)return Math.round(d/30.44)+' months';if(d>=2)return d.toFixed(d>=10?0:1)+' days';if(h>=2)return h.toFixed(1)+' hours';if(m>=2)return Math.round(m)+' minutes';return Math.round(s)+' seconds'};const when=s=>new Date(Date.now()+s*1000).toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'});let rate=null,last=null;function row(k,target,done,unit){const p=100*done/target;el('tg'+k+'Pct').textContent=done>=target?'Reached · '+pct(p):pct(p);el('tg'+k+'Bar').style.width=Math.min(100,Math.max(p,done>0?0.6:0))+'%';const left=target-done;if(left<=0){el('tg'+k+'Left').textContent='Reached: '+short(done)+' of '+short(target)+' '+unit+' ('+(done/target).toFixed(2)+'×).';return}const t=rate>0?dur(left/rate):null;el('tg'+k+'Left').textContent=short(left)+' '+unit+' to go'+(t?' · about '+t+' at this rate (around '+when(left/rate)+')':'')+'.'}async function tick(){if(document.hidden&&last)return;try{const r=await fetch('./status',{cache:'no-store',signal:AbortSignal.timeout(10000)});if(!r.ok)throw new Error(String(r.status));const s=await r.json();if(!Number.isFinite(s.tokens)||!Number.isFinite(s.params)||s.params<=0)throw new Error('format');const now=Date.now(),t=s.training_throughput;let inst=null;if(t&&t.state==='measured'&&Number.isFinite(t.bytes_per_s)&&t.bytes_per_s>=0)inst=t.bytes_per_s;else if(last&&s.tokens>=last.tokens&&now-last.time>=5000)inst=(s.tokens-last.tokens)/((now-last.time)/1000);if(last&&s.tokens<last.tokens)rate=null;last={time:now,tokens:s.tokens};if(inst!==null)rate=rate===null?inst:0.8*rate+0.2*inst;const unit='bytes';el('tgDone').textContent=nf.format(s.tokens);el('tgRate').textContent=rate>0?'About '+short(rate)+' bytes a second, '+short(rate*86400)+' a day, at the current rate.':'Measuring the network rate…';const chin=20*s.params;el('tgCLabel').textContent='Chinchilla: 20 × '+short(s.params)+' parameters = '+short(chin)+' bytes';row('C',chin,s.tokens,unit);row('5',5e11,s.tokens,unit);row('1',1e12,s.tokens,unit);el('tgNote').textContent='Only bytes from updates that passed the test count, and text can repeat. The Chinchilla rule was measured on subword tokens, so for bytes it is a rough mark.'}catch(e){el('tgRate').textContent='Waiting for live metrics…'}}tick();setInterval(tick,15000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)tick()})})();</script></section>
+<section class="columns" aria-label="Network throughput"><div class="card"><h2>Network training throughput</h2><strong id="trainRate" style="font-size:32px;font-variant-numeric:tabular-nums">Measuring…</strong><p class="small">Bytes of text trained on per second, from updates that passed the test</p><p id="rateWindow" class="small">Collecting at least 30 seconds of coordinator counter samples.</p><p class="small">Every update from every computer, ours included, is tested before it merges. It must show a learning gain on its training text and pass checks on held-out text that workers do not receive. Updates that fail are refused and not counted.</p><p id="usefulNow" class="small"></p><p class="small">These are bytes, not the subword tokens larger models count.</p></div><div class="card"><h2>Network inference throughput</h2><strong id="inferRate" style="font-size:32px;font-variant-numeric:tabular-nums">Connecting…</strong><p class="small">Bytes generated per second on the network, over the last hour's generations. Each byte travels through the blocks as a chain of hops, each run by a worker holding that block.</p><p id="inferDetail" class="small"></p></div></section><div class="columns"><section class="card"><h2>Work across the blocks</h2><p class="small">Updates merged per block. Blocks with the most left to learn get the most work.</p><div id="blocks"><p>Waiting for block metrics…</p></div></section><section class="card"><h2>Evaluation history</h2><p class="small">Held-out denoising loss for the top block, in bits per byte. Lower is better.</p><div id="chart" class="chart"><p>No evaluation loaded yet.</p></div><div class="evals"><span id="firstEval">—</span><span id="lastEval">—</span></div><p id="evalTime" class="small"></p><p id="genQuality" class="small"></p><details><summary>Latest saved model sample</summary><p class="small">What the model wrote at the last evaluation, unedited.</p><div class="sample" id="sample">No sample available.</div></details></section></div>
+<section class="card" style="margin-top:18px" aria-label="Network workers"><div class="eyebrow">Participation</div><h2 style="margin-top:8px">Workers on this run</h2><p id="workerSummary">Waiting for worker records…</p><p id="newWorkers" class="small" role="status" aria-live="polite"></p><p class="small">One card per worker. Green means it checked in within the last 45 seconds or merged an update in the last 2 minutes; amber means neither. Anyone leaving for good can take their own cards off the list.</p><div style="margin:12px 0"><p id="ownerStatus" class="small" role="status" aria-live="polite">Checking for an existing private owner session…</p><p class="small">Signed in as the owner, your workers show in blue.</p><a href="/agillm-linger/" id="ownerLogin">Sign in with the existing owner login</a></div><div id="workerCards" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,225px),1fr));gap:12px;margin-top:18px"></div><p class="small" style="margin-top:14px">No names, hostnames or addresses are shown. Hardware is what each worker reports about itself. Speed is measured by the coordinator.</p></section><section class="card" style="margin-top:18px" aria-label="Try the model" id="try-model"><div class="eyebrow">Public inference demo</div><h2 style="margin-top:8px">Try a short continuation</h2><p>This runs on the network: your text goes from worker to worker, one hop per block for every byte, and you can watch which worker ran each hop. If no worker holds a block, the coordinator runs that hop and says so. It's a small model early in training, so expect broken text.</p><p class="small">Do not enter private information or secrets. Your text is sent to participants' computers as well as the coordinator.</p><label for="prompt" style="display:block;margin-top:16px">Starting text</label><textarea id="prompt" maxlength="200" rows="3" style="width:100%;resize:vertical;background:#080e14;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:12px;font:inherit">The </textarea><div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:14px 0"><label for="length">Bytes</label><select id="length" style="background:#080e14;color:var(--text);padding:10px;border:1px solid var(--line);border-radius:8px"><option value="32">32</option><option value="64">64</option></select><label for="sampler">Route</label><select id="sampler" style="background:#080e14;color:var(--text);padding:10px;border:1px solid var(--line);border-radius:8px"><option value="chain">Every block, a worker per hop</option><option value="top">Top block only, clearest text for now</option></select><button id="generate" type="button">Generate</button><span id="generationStatus" class="small" role="status" aria-live="polite">Ready when you are.</span></div><pre id="generated" aria-label="Generated text" style="min-height:80px;white-space:pre-wrap">Your continuation will appear here.</pre><p id="route" class="small" style="overflow-wrap:anywhere"></p><p class="small">One generation at a time across the whole network, so you may need to wait a moment. No account needed.</p></section><section class="card join"><div><div class="eyebrow">Contribute compute</div><h2 style="margin-top:8px">Join with one command</h2><p>No account and nobody to ask. Your worker gets its own credential, trains one block at a time and serves that block for network inference. A GPU is optional. Contributions use compute, power and bandwidth.</p><ol><li>On Linux or macOS, run the command. It installs what it needs in <code>~/dbmoe-worker</code> and starts.</li><li>On Windows, or to set it up by hand, use the second set of commands.</li><li>Leave it running as long as you like. Stop it with Ctrl+C and start it again whenever you want; it keeps its credential.</li><li>Leaving for good? Run the leave command: your workers come off the list and your credential ends. What you already contributed stays in the model. You can rejoin at any time.</li></ol><p class="small">Every update is tested before it merges. Your worker's card shows its CPU, RAM and GPU, and <code>--no-share-hardware</code> keeps them off the list. Keep credentials out of GitHub, screenshots and public messages.</p></div><div><p><a href="https://github.com/Marxist-Leninist/dbmoe" rel="noopener noreferrer">Worker source and setup guide on GitHub</a></p><pre><code># Linux or macOS
+curl -fsSL https://codex.opentransformers.online/dbmoe/join.sh | sh
+
+# Windows, or by hand (Windows: py instead of python3, curl.exe in PowerShell)
+python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+curl -fsSL https://codex.opentransformers.online/dbmoe/code -o dbmoe.py
+python3 dbmoe.py worker
+
+# Options: --device cuda|rocm|mps  --threads 4  --hours 1  --no-serve
+
+# Leaving for good: takes you off the worker list
+curl -fsSL https://codex.opentransformers.online/dbmoe/leave.sh | sh</code></pre><p class="small">Use only computers you own or are authorized to use. Source and setup guide: <a href="https://github.com/Marxist-Leninist/dbmoe" rel="noopener noreferrer">GitHub repository</a>.</p><details style="margin-top:18px"><summary>Use one identity across several machines</summary><p class="small">After installing the worker, create one contributor token. Copy its file securely to the other computers you own or are authorised to use. Start each machine with a different worker name; their contributions share the same identity.</p><pre><code># Create the shared identity once
+python3 dbmoe.py enrol --token-file contributor.token
+
+# On each machine, use its own name
+python3 dbmoe.py worker --token @contributor.token --name machine-01</code></pre><p class="small">Keep contributor.token private. Change machine-01 for each computer. To join anonymously with a separate identity, use the normal worker command above; no account is needed.</p></details></div></section>
+<section aria-label="Model configuration"><div class="metadata" id="metadata"></div><p class="small" id="source"></p></section>
+<footer>Public progress and sample demo · No account required · Metrics come from the coordinator and refresh every 15 seconds.</footer>
+</main><script>
+'use strict';
+const $=id=>document.getElementById(id), fmt=new Intl.NumberFormat('en-GB');
+let busy=false,lastSuccess=0;
+const samples=[];
+const workerAliases=new Map();let initialWorkers=null;
+const workerHistoryKey='dbmoe-public-worker-history-v1';let workerHistory={};
+try{const old=JSON.parse(localStorage.getItem(workerHistoryKey)||'{}');for(const [id,r] of Object.entries(old))if(/^worker-[0-9a-f]{16}$/.test(id)&&r&&typeof r==='object')workerHistory[id]={updates:Number(r.updates)||0,last:typeof r.last==='string'?r.last:null,seen:Number(r.seen)||0};}catch(e){}
+let latestWorkerReceived=0;
+function hardwareLines(value){
+if(!value||value.schema!==1||value.self_reported!==true||!['cpu','cuda','rocm','mps'].includes(value.backend))return null;
+const safe=v=>typeof v==='string'?v.replace(/[\u0000-\u001f\u007f]/g,'').trim().slice(0,80):'';
+const count=v=>Number.isInteger(v)&&v>=1&&v<=4096?v:null;
+const memory=(v,max)=>Number.isFinite(v)&&v>0&&v<=max?v.toFixed(1)+' GiB':null;
+const lines=['Training on: '+({cpu:'CPU',cuda:'NVIDIA GPU',rocm:'AMD GPU',mps:'Apple GPU'}[value.backend])];
+lines.push('CPU: '+(safe(value.cpu_model)||'Not reported'));
+if(safe(value.cpu_arch))lines.push('CPU architecture: '+safe(value.cpu_arch));
+lines.push('Logical CPUs: '+(count(value.cpu_cores)||'Not reported'));
+lines.push('Worker CPU threads: '+(count(value.cpu_threads)||'Not reported'));
+lines.push('System RAM: '+(memory(value.ram_gib,1048576)||'Not reported'));
+lines.push('Operating system: '+(safe(value.os)||'Not reported'));
+if(value.backend!=='cpu'){
+lines.push('GPU: '+(safe(value.gpu_name)||'Not reported'));
+lines.push('GPU memory: '+(value.backend==='mps'?'Not reported (Metal)':memory(value.gpu_memory_gib,65536)||'Not reported'));
+}
+if(safe(value.torch_version))lines.push('PyTorch: '+safe(value.torch_version));
+if(safe(value.runtime_version))lines.push('Runtime: '+safe(value.runtime_version));
+return lines;
+}
+function workerState(record,lease,now,present,sourceStale,peer){
+const stamp=Date.parse(record.last),age=Number.isFinite(stamp)?(now-stamp)/1000:Infinity;
+if(sourceStale)return {label:'Status unknown · page data is old',colour:'#ffca84',rank:2};
+if(peer)return {label:lease?'Online · training':'Online',colour:'var(--accent)',rank:0};
+if(!present)return {label:'Not seen lately',colour:'#ffca84',rank:3};
+if(age>=-30&&age<=120)return {label:lease?'Active · training':'Active',colour:'var(--accent)',rank:0};
+if(lease&&Number(lease.age_s)<=120)return {label:'Active · just started a job',colour:'var(--accent)',rank:0};
+return {label:lease?'Has a job, no recent update':'Not active',colour:'#ffca84',rank:1};
+}
+let ownerWorkers=new Set(),ownerTestCompletions={},latestWorkerSnapshot=null,latestWorkerClock=0,ownerView=false,ownerCheckBusy=false;
+async function checkOwner(){
+if(ownerCheckBusy)return;ownerCheckBusy=true;
+try{const response=await fetch('./owner-workers',{cache:'no-store',credentials:'same-origin',signal:AbortSignal.timeout(5000)});
+if(!response.ok)throw new Error('Owner session unavailable');
+const data=await response.json();if(!Array.isArray(data.owned_worker_ids))throw new Error('Invalid owner map');
+ownerWorkers=new Set(data.owned_worker_ids.filter(v=>/^worker-[0-9a-f]{16}$/.test(v)));ownerTestCompletions={};for(const [id,count] of Object.entries(data.completed_tests||{}))if(ownerWorkers.has(id)&&Number.isInteger(count)&&count>=0)ownerTestCompletions[id]=count;ownerView=true;
+show('ownerStatus','Private owner view: '+ownerWorkers.size+' verified owner worker identities. Blue cards are yours. Verified '+(data.verified_at||'recently')+'.');
+$('ownerLogin').hidden=true;
+}catch(e){ownerWorkers.clear();ownerTestCompletions={};ownerView=false;show('ownerStatus','Public view: ownership is hidden. Sign in to identify your verified workers automatically.');$('ownerLogin').hidden=false;}
+finally{ownerCheckBusy=false;if(latestWorkerSnapshot)workers(latestWorkerSnapshot,latestWorkerClock,false)}
+}
+function workers(s,serverNow,remember=true){
+if(remember){latestWorkerSnapshot=s;latestWorkerClock=serverNow;latestWorkerReceived=Date.now();}
+const records=s.workers&&typeof s.workers==='object'?s.workers:{};
+const leases=Array.isArray(s.active_leases)?s.active_leases:[];
+const leaseMap=new Map();for(const l of leases)if(typeof l.worker==='string')leaseMap.set(l.worker,l);
+const peers=s.net_inference&&s.net_inference.peers&&typeof s.net_inference.peers==='object'?s.net_inference.peers:{};
+const current=new Set([...Object.keys(records),...leaseMap.keys()].filter(id=>/^worker-[0-9a-f]{16}$/.test(id)));
+if(remember&&Array.isArray(s.left_workers))for(const id of s.left_workers)if(!current.has(id))delete workerHistory[id];
+if(remember){for(const id of current){const r=records[id]||{},old=workerHistory[id]||{};workerHistory[id]={updates:Number.isFinite(Number(r.updates))?Number(r.updates):(old.updates||0),last:typeof r.last==='string'?r.last:(old.last||null),seen:serverNow};}
+try{localStorage.setItem(workerHistoryKey,JSON.stringify(workerHistory))}catch(e){}}
+const ids=Object.keys(workerHistory).sort();
+for(const id of ids)if(!workerAliases.has(id))workerAliases.set(id,'Worker '+String(workerAliases.size+1).padStart(2,'0'));
+if(initialWorkers===null&&remember)initialWorkers=new Set(ids);
+const newcomers=initialWorkers?ids.filter(id=>!initialWorkers.has(id)):[];
+const staleSource=lastSuccess===0||Date.now()-lastSuccess>45000;
+const states=new Map(ids.map(id=>{const completed=ownerView&&ownerWorkers.has(id)&&!leaseMap.has(id)&&ownerTestCompletions[id]===workerHistory[id].updates;return [id,completed?{label:'Your test, completed',colour:'var(--blue)',rank:4}:workerState(workerHistory[id],leaseMap.get(id),serverNow,current.has(id),staleSource,peers[id])];}));
+const recent=ids.filter(id=>{const age=serverNow-Date.parse(workerHistory[id].last);return current.has(id)&&age>=-30000&&age<=120000}).length;
+const inactive=ids.filter(id=>states.get(id).rank>=1&&states.get(id).rank<=3).length;const completed=ids.filter(id=>states.get(id).rank===4).length;
+const reported=Object.keys(peers).map(id=>(records[id]||{}).hardware).filter(Boolean),threads=reported.reduce((n,h)=>n+(Number.isInteger(h.cpu_threads)?h.cpu_threads:0),0),gpus=reported.filter(h=>h.backend&&h.backend!=='cpu').length;
+show('workerSummary',ids.length+' workers · '+Object.keys(peers).length+' online · '+leaseMap.size+' training · '+inactive+' not active'+(threads?' · '+fmt.format(threads)+' CPU threads':'')+(gpus?' · '+gpus+(gpus===1?' GPU':' GPUs'):'')+(ownerView?' · '+completed+' completed owner tests':''));
+show('newWorkers',newcomers.length?newcomers.length+' new since this page opened.':'');
+$('workerCards').replaceChildren();
+if(!ids.length){const empty=document.createElement('p');empty.textContent='No workers reported yet.';$('workerCards').append(empty);return}
+ids.sort((a,b)=>states.get(a).rank-states.get(b).rank||workerAliases.get(a).localeCompare(workerAliases.get(b)));
+ids.forEach(id=>{const r=workerHistory[id],lease=leaseMap.get(id),status=states.get(id),card=document.createElement('article');card.style.cssText='border:1px solid var(--line);border-radius:9px;padding:15px';if(ownerView&&ownerWorkers.has(id)){card.style.borderColor='var(--blue)';card.style.background='#142739'}
+const title=document.createElement('strong');title.textContent=workerAliases.get(id)+(!initialWorkers||initialWorkers.has(id)?'':' · New')+(ownerView?(ownerWorkers.has(id)?' · Yours (verified)':' · Ownership unknown'):'');
+const state=document.createElement('p');state.className='small';state.style.color=status.colour;state.textContent=status.label;
+const count=document.createElement('p');count.className='small';count.textContent=fmt.format(Number(r.updates)||0)+' accepted '+(Number(r.updates)===1?'update':'updates')+(Number((records[id]||{}).refused)?' · '+fmt.format(Number(records[id].refused))+' refused':'');
+const last=document.createElement('p');last.className='small';const stamp=Date.parse(r.last),age=(serverNow-stamp)/1000;last.textContent=!Number.isFinite(stamp)?'No accepted update yet':'Last update '+(age<60?'under a minute ago':age<7200?Math.floor(age/60)+' min ago':Math.floor(age/3600)+' hours ago');
+const observed=document.createElement('p');observed.className='small';const speed=Number((records[id]||{}).measured_bytes_s);observed.textContent=[lease&&Number.isInteger(lease.block)?'Training block '+(lease.block+1)+' now':'',Number.isFinite(speed)&&speed>0?'Speed: '+fmt.format(Math.round(speed))+' bytes/s':''].filter(Boolean).join(' · ');
+const peer=peers[id],serving=document.createElement('p');serving.className='small';serving.textContent=peer&&Number.isInteger(peer.block)?'Serving block '+(peer.block+1)+' · '+fmt.format(Number(peer.hops)||0)+(Number(peer.hops)===1?' hop':' hops')+' · '+fmt.format(Number(peer.ms)||0)+' ms per hop':'';
+const alias=document.createElement('p');alias.className='small';alias.textContent='Anonymous ID: '+id;card.append(title,state,count,last,observed,serving,alias);const hardware=document.createElement('div');hardware.className='small';hardware.style.cssText='border-top:1px solid var(--line);margin-top:10px;padding-top:10px';const lines=hardwareLines((records[id]||{}).hardware);const heading=document.createElement('strong');heading.textContent=lines?'Hardware':'Hardware not shared';hardware.append(heading);if(lines){for(const line of lines){const p=document.createElement('p');p.className='small';p.textContent=line;hardware.append(p)}}card.append(hardware);$('workerCards').append(card)});
+}
+let generating=false,nextGeneration=0;
+function generationButton(){const remaining=Math.max(0,Math.ceil((nextGeneration-Date.now())/1000));$('generate').disabled=generating||remaining>0;$('generate').textContent=generating?'Generating…':remaining?'Wait '+remaining+'s':'Generate'}
+async function generateSample(){
+if(generating||Date.now()<nextGeneration)return;
+const prompt=$('prompt').value.slice(0,200);if(!prompt.trim()){show('generationStatus','Enter a little starting text first.');return}
+const length=$('length').value==='64'?64:32;
+generating=true;nextGeneration=Date.now()+60000;generationButton();show('generationStatus','Sending your text across the network…');show('generated',prompt);show('route','');
+const start=performance.now(),lineDecoder=new TextDecoder(),byteDecoder=new TextDecoder();let text=prompt,pending='',count=0,finished=null;
+const handle=ev=>{if(ev.t==='byte'){text+=byteDecoder.decode(new Uint8Array([ev.b]),{stream:true});count++;show('generated',text);show('generationStatus','Generating on the network · '+count+' of '+length+' bytes…');show('route','Last byte: '+ev.hops.map(h=>'Block '+(h.block+1)+' on '+(h.via==='coordinator'?'the coordinator':(workerAliases.get(h.via)||h.via))+' ('+h.ms+' ms)').join(' → '))}else if(ev.t==='done')finished=ev;else if(ev.t==='error')throw new Error(ev.error)};
+try{const sampler=$('sampler').value==='top'?'top':'chain';const q=new URLSearchParams({net:'1',prompt,n:String(length),sampler,temp:sampler==='top'?'0.75':'0',seed:String(Math.floor(Math.random()*2147483647))});
+const response=await fetch('./sample?'+q,{cache:'no-store',signal:AbortSignal.timeout(300000)});
+if(response.status===429||response.status===503){show('generationStatus','The shared demo is busy or rate-limited. Try again after the countdown.');show('generated','No result received.');return}
+if(!response.ok||!response.body)throw new Error('Sample unavailable');
+const reader=response.body.getReader();
+for(;;){const {value,done}=await reader.read();if(done)break;pending+=lineDecoder.decode(value,{stream:true});const lines=pending.split('\n');pending=lines.pop();lines.filter(Boolean).forEach(l=>handle(JSON.parse(l)))}
+if(!finished)throw new Error('Stream ended early');
+const elapsed=Math.max((performance.now()-start)/1000,0.001);
+show('generationStatus','Done · '+(count/elapsed).toFixed(2)+' bytes/s · '+elapsed.toFixed(1)+'s from button to done · '+fmt.format(finished.hops_network)+' hops on '+finished.workers+(finished.workers===1?' worker':' workers')+(finished.hops_coordinator?' · '+fmt.format(finished.hops_coordinator)+' on the coordinator':'')+'.');refresh();
+}catch(e){show('generationStatus','The generation stopped early. Wait before trying again.');if(text===prompt)show('generated','Generation did not complete in this browser.');}
+finally{generating=false;generationButton()}
+}
+$('generate').addEventListener('click',generateSample);setInterval(generationButton,1000);
+const number=v=>Number.isFinite(Number(v))?Number(v):null;
+function show(id,value){$(id).textContent=value}
+function rate(s,serverNow=Date.now()){
+const recent=s.training_throughput;
+const numeric=v=>typeof v==='number'&&Number.isFinite(v)&&v>=0;
+const ended=recent&&typeof recent.window_end_utc==='string'?Date.parse(recent.window_end_utc):NaN;
+if(recent&&recent.state==='measured'&&numeric(recent.bytes_per_s)&&numeric(recent.window_s)&&recent.window_s>=30&&recent.window_s<=61&&numeric(recent.accepted_byte_targets)&&Number.isFinite(ended)&&serverNow-ended>=-3000&&serverNow-ended<=20000){
+samples.length=0;
+show('trainRate',fmt.format(Math.round(recent.bytes_per_s))+' / s');
+show('rateWindow',fmt.format(recent.accepted_byte_targets)+' bytes in the last '+Math.round(recent.window_s)+' seconds · measured by the coordinator');
+return
+}
+const now=performance.now();
+if(samples.length&&(s.tokens<samples[samples.length-1].tokens||now-samples[samples.length-1].time>30000))samples.length=0;
+samples.push({time:now,tokens:s.tokens});
+while(samples.length>1&&now-samples[0].time>65000)samples.shift();
+const first=samples[0],seconds=(now-first.time)/1000;
+if(seconds<30){show('trainRate','Measuring…');show('rateWindow','Collecting at least 30 seconds of coordinator counter samples.');return}
+show('trainRate',fmt.format(Math.round((s.tokens-first.tokens)/seconds))+' / s');
+show('rateWindow',fmt.format(s.tokens-first.tokens)+' bytes in the last '+Math.round(seconds)+' seconds · measured on this page');
+}
+function usefulCard(g){if(!g||typeof g!=='object'){show('usefulNow','');return}
+const parts=[fmt.format((number(g.passed)||0)+(number(g.refused)||0))+' updates tested',fmt.format(number(g.refused)||0)+' refused'];
+if(typeof g.recent_improved==='number'&&Number.isFinite(g.recent_improved)&&number(g.recent_tested))parts.push(Math.round(100*g.recent_improved)+'% of the last '+fmt.format(g.recent_tested)+' made held-out text better');
+show('usefulNow',parts.join(' · '))}
+function networkCard(n){if(!n||typeof n!=='object'){show('inferRate','Unavailable');show('inferDetail','');return}
+const speed=number(n.bytes_per_s_last_hour);show('inferRate',!speed?(n.ready?'Ready':'Waiting for workers'):speed.toFixed(2)+' bytes / s');
+show('inferDetail',[fmt.format(number(n.covered_blocks)||0)+' of '+fmt.format(number(n.blocks)||0)+' blocks have a worker online',fmt.format(number(n.online_workers)||0)+' workers serving',fmt.format(number(n.hops_network)||0)+' hops run on workers',fmt.format(number(n.hops_coordinator)||0)+' on the coordinator',fmt.format(number(n.audits)||0)+' spot-checked',fmt.format(number(n.audit_failures)||0)+' wrong'].join(' · '))}
+function draw(s,serverNow=Date.now()){
+rate(s,serverNow);workers(s,serverNow);networkCard(s.net_inference);usefulCard(s.gate);
+show('updates',fmt.format(s.updates));show('bytes',fmt.format(s.tokens));
+show('workers',new Set((s.active_leases||[]).map(v=>v.worker)).size);
+const ev=s.last_eval||{};show('bpb',number(ev.ar_bits_per_byte)===null?'Not evaluated':Number(ev.ar_bits_per_byte).toFixed(3));
+const values=Array.isArray(s.block_updates)?s.block_updates:[],max=Math.max(1,...values);
+$('blocks').replaceChildren();
+values.forEach((v,i)=>{const row=document.createElement('div');row.className='barrow';const label=document.createElement('div');label.className='barlabel';const name=document.createElement('span');name.textContent='Block '+(i+1);const total=document.createElement('span');total.textContent=fmt.format(v)+' updates';label.append(name,total);const track=document.createElement('div');track.className='track';const fill=document.createElement('div');fill.className='fill';fill.style.width=(100*v/max)+'%';track.append(fill);row.append(label,track);$('blocks').append(row)});
+const h=(s.eval_history||[]).filter(p=>number(p.ar_bpb)!==null&&number(p.updates)!==null);
+$('chart').replaceChildren();
+if(h.length){const ns='http://www.w3.org/2000/svg',svg=document.createElementNS(ns,'svg');svg.setAttribute('viewBox','0 0 420 160');svg.setAttribute('role','img');svg.setAttribute('aria-label','Evaluation bits per byte: '+h.map(p=>'update '+p.updates+': '+p.ar_bpb).join('; '));
+const lo=Math.min(...h.map(p=>p.ar_bpb)),hi=Math.max(...h.map(p=>p.ar_bpb)),x0=h[0].updates,x1=h[h.length-1].updates;
+const points=h.map((p,i)=>[h.length===1?210:15+390*(p.updates-x0)/Math.max(1,x1-x0),140-120*(p.ar_bpb-lo)/Math.max(.1,hi-lo)]);
+const line=document.createElementNS(ns,'polyline');line.setAttribute('points',points.map(p=>p.join(',')).join(' '));line.setAttribute('fill','none');line.setAttribute('stroke','#86e9bc');line.setAttribute('stroke-width','3');svg.append(line);
+points.forEach((p,i)=>{const dot=document.createElementNS(ns,'circle');dot.setAttribute('cx',p[0]);dot.setAttribute('cy',p[1]);dot.setAttribute('r','4');dot.setAttribute('fill','#8ebfff');const title=document.createElementNS(ns,'title');title.textContent='Update '+h[i].updates+': '+h[i].ar_bpb+' bits/byte';dot.append(title);svg.append(dot)});$('chart').append(svg);
+show('firstEval','Update '+fmt.format(h[0].updates)+' · '+h[0].ar_bpb+' bpb');show('lastEval','Update '+fmt.format(h[h.length-1].updates)+' · '+h[h.length-1].ar_bpb+' bpb');
+}else{show('chart','Awaiting the first completed evaluation.');show('firstEval','—');show('lastEval','—')}
+show('evalTime',ev.t?'Last evaluation: '+ev.t+' · update '+fmt.format(ev.updates):'No completed evaluation reported.');
+show('genQuality',[ev.chain_gen_bits,ev.top_gen_bits,ev.real_bits].every(v=>typeof v==='number'&&Number.isFinite(v))?'Generated text scored against the statistics of real text, in bits per byte: every block '+ev.chain_gen_bits.toFixed(2)+', top block '+ev.top_gen_bits.toFixed(2)+', real text '+ev.real_bits.toFixed(2)+'. Closer to real text is better.':'');
+show('sample',typeof ev.sample==='string'?ev.sample:'No sample available.');
+const cfg=s.cfg||{},tags=[fmt.format(s.params)+' parameters',cfg.blocks+' blocks',cfg.experts+' experts / block','Context: '+cfg.ctx+' bytes',s.version||''];
+$('metadata').replaceChildren();tags.forEach(t=>{const el=document.createElement('span');el.textContent=t;$('metadata').append(el)});
+show('source','Reported dataset: '+((s.data||{}).source||'Unavailable'));
+}
+async function refresh(){if(busy)return;busy=true;$('refresh').disabled=true;try{
+const r=await fetch('./status',{cache:'no-store',signal:AbortSignal.timeout(10000)});if(!r.ok)throw new Error('Status endpoint returned HTTP '+r.status);
+const s=await r.json();if(!Number.isFinite(s.updates)||!Number.isFinite(s.tokens)||!Array.isArray(s.block_updates))throw new Error('Unexpected metrics format');
+lastSuccess=Date.now();draw(s,Date.parse(r.headers.get('Date'))||Date.now());show('connection','Status endpoint connected');$('connection').classList.remove('warn');show('updated','Last received '+new Date(lastSuccess).toLocaleTimeString()+' · refreshes every 15 seconds');show('error','');
+}catch(e){show('trainRate','Unavailable');show('rateWindow','Waiting for fresh coordinator samples.');samples.length=0;show('connection',lastSuccess?'Connection lost · showing last received metrics':'Metrics unavailable');$('connection').classList.add('warn');show('error','Could not refresh. '+(lastSuccess?'The displayed values may be stale. ':'')+'Try Refresh shortly.');}finally{busy=false;$('refresh').disabled=false}}
+workers({workers:{},active_leases:[]},Date.now(),false);setInterval(()=>{if(latestWorkerSnapshot){const elapsed=Date.now()-latestWorkerReceived;const snapshot={...latestWorkerSnapshot,active_leases:(latestWorkerSnapshot.active_leases||[]).map(l=>({...l,age_s:Number(l.age_s)+elapsed/1000}))};workers(snapshot,latestWorkerClock+elapsed,false)}},15000);checkOwner();setInterval(checkOwner,60000);$('refresh').addEventListener('click',()=>{refresh();checkOwner()});document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh()});refresh();setInterval(()=>{if(!document.hidden)refresh()},15000);
+</script></body></html>

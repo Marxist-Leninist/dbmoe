@@ -1217,6 +1217,7 @@ class Coordinator:
         self.lock = threading.RLock()
         self.save_lock = threading.Lock()
         self.pending_leases = {}
+        self.pending_workers = set()
         self.max_identity_leases = 256
         self.max_active_leases = 512                    # what one coordinator can serve, not a limit on people
         self.reserved_leases = 8                        # only tokens from tokens.json can use these
@@ -1359,6 +1360,9 @@ class Coordinator:
         # Reserve capacity before consuming data, including concurrent requests.
         with self.lock:
             self.expire()
+            key = (owner, worker)
+            if key in self.pending_workers:
+                raise LeaseCapacityError('lease request already pending for this worker; retry shortly')
             pending = self.pending_leases.get(owner, 0)
             if is_open:
                 t = time.time()
@@ -1367,27 +1371,20 @@ class Coordinator:
                 if len(self.last_open_lease) > 20000:
                     self.last_open_lease = {k: v for k, v in self.last_open_lease.items() if t - v < 60}
                 self.last_open_lease[worker] = t
-            live = [v for v in self.leases.values() if not (v['worker'] == worker and v['session'] == session)]     # its own last job is replaced
+            live = [v for v in self.leases.values() if not (v['worker'] == worker and v.get('owner', v['worker'].split('/', 1)[0]) == owner)]     # the same owner's stable worker replaces its prior job, including after restart
             replacing = len(live) < len(self.leases)
             own = sum(v.get('owner', v['worker'].split('/', 1)[0]) == owner for v in live)
             total = len(live) + sum(self.pending_leases.values())
             cap = self.max_open_leases if is_open else self.max_identity_leases
-            full = lambda: own + pending >= cap or total >= self.max_active_leases - (self.reserved_leases if is_open and not replacing else 0)
-            old = None
-            if full():                                  # a machine that restarted still holds a job from before, and that one can go
-                mine = [k for k, v in self.leases.items() if v['worker'] == worker and v['session'] != session]
-                if mine:
-                    old = min(mine, key=lambda k: self.leases[k]['t0'])
-                    own, total, replacing = own - 1, total - 1, True
-            if full():
+            if own + pending >= cap or total >= self.max_active_leases - (self.reserved_leases if is_open and not replacing else 0):
                 raise LeaseCapacityError('active lease capacity reached; finish existing work first')
-            if old:
-                self.log(ev='lease_abandoned', lease=old, block=self.leases.pop(old)['block'], worker=worker)
             self.pending_leases[owner] = pending + 1
+            self.pending_workers.add(key)
         try:
             return self._lease(worker, steps, batch, session, owner, client)
         finally:
             with self.lock:
+                self.pending_workers.discard(key)
                 left = self.pending_leases[owner] - 1
                 if left:
                     self.pending_leases[owner] = left
@@ -1400,7 +1397,7 @@ class Coordinator:
         data = self.data.windows(steps * batch, self.model.cfg['ctx'])      # before taking the lock (may wait on HF)
         with self.lock:
             self.expire()
-            for k in [k for k, v in self.leases.items() if v['worker'] == worker and v['session'] == session]:
+            for k in [k for k, v in self.leases.items() if v['worker'] == worker and v.get('owner', v['worker'].split('/', 1)[0]) == owner]:
                 self.log(ev='lease_abandoned', lease=k, block=self.leases.pop(k)['block'], worker=worker)
             B, bu = self.model.cfg['blocks'], self.meta['block_updates']
             active = [0] * B
@@ -1555,7 +1552,7 @@ class Coordinator:
         why = None
         before, after = m['before'], m['after']
         if before is None:
-            why = f"it did not learn from the text it trained on ({m['trained_before']:.4f} -> {m['trained_after']:.4f})"
+            why = f"the change on its training text did not meet the required learning margin ({m['trained_before']:.4f} -> {m['trained_after']:.4f})"
         elif not math.isfinite(after) or not math.isfinite(m['shared_after']) or (o is not None and not math.isfinite(m['other_after'])):
             why = 'the result is not a number'
         else:

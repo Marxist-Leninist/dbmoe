@@ -1,0 +1,23 @@
+[package]
+name = "dbmoe-web"
+version = "0.1.0"
+edition = "2021"
+description = "The DBMoE Rust worker's training step in the browser: WebAssembly + WebGPU"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+dbmoe-worker = { path = "..", features = ["wgpu"] }
+console_error_panic_hook = "0.1"
+serde_json = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+# Burn draws random numbers through rand 0.10 -> getrandom 0.4; in a browser they come from crypto.getRandomValues.
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[profile.release]
+lto = true
+opt-level = 3

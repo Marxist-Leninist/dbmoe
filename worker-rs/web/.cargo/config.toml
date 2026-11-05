@@ -1,0 +1,3 @@
+[build]
+# This crate only makes sense in a browser.
+target = "wasm32-unknown-unknown"

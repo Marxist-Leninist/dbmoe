@@ -1,6 +1,6 @@
 name: tests
 
-# Runs the full unit suite on real Linux, Windows and Apple Silicon (macOS arm64) machines.
+# Runs the full unit suite on real Linux, Windows and Apple Silicon (macos-latest is arm64) machines.
 # GPU paths are exercised where the runner has the hardware (MPS on Apple Silicon if the
 # hosted runner exposes Metal); CUDA, ROCm and XPU tests skip themselves when absent.
 on:
@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-14]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     env:
       OMP_NUM_THREADS: "2"
       PYTHONUNBUFFERED: "1"

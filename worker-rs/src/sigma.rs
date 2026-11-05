@@ -120,6 +120,22 @@ impl Rng {
         (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
     }
 
+    /// `n` standard-normal values from this seeded stream, using paired Box–Muller draws.
+    /// Keeping this off backend RNGs makes training replay consistent across CPU, GPU and browser workers.
+    pub fn standard_normals(&mut self, n: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            // uniform() is [0, 1), so 1 - uniform() is (0, 1] and its logarithm is finite.
+            let radius = (-2.0 * (1.0 - self.uniform()).ln()).sqrt();
+            let angle = 2.0 * PI * self.uniform();
+            out.push((radius * angle.cos()) as f32);
+            if out.len() < n {
+                out.push((radius * angle.sin()) as f32);
+            }
+        }
+        out
+    }
+
     /// Lower-case hex of `n` random bytes.
     pub fn hex(&mut self, n: usize) -> String {
         (0..n).map(|_| format!("{:02x}", self.next_u64() as u8)).collect()

@@ -1,6 +1,6 @@
 //! Training: one step (`dblock_loss`, backward, clip, AdamW) and one lease (`train_lease` in dbmoe.py).
 
-use burn::tensor::{Device, Distribution, Tensor};
+use burn::tensor::{Device, Tensor, TensorData};
 
 use crate::model::{dblock_loss, read_f32, Batch, Cfg, HostTensor, Named, Params};
 use crate::optim::{clip_grad_norm, AdamW, OptState};
@@ -172,7 +172,10 @@ pub async fn train_lease(lease: &Lease, device: &Device, cache: &mut OptCache, r
         let rows = &lease.data[s * bs * t1..(s + 1) * bs * t1];
         let batch = Batch { ids: rows.iter().map(|&x| x as usize).collect(), b: bs, t1, sigma: sample_sigma(cfg, lo, hi, bs, rng) };
         batch.validate(cfg)?;
-        let eps = Tensor::<3>::random([bs, t1 - 1, cfg.d], Distribution::Normal(0.0, 1.0), device);
+        let eps = Tensor::<3>::from_data(
+            TensorData::new(rng.standard_normals(bs * (t1 - 1) * cfg.d), [bs, t1 - 1, cfg.d]),
+            device,
+        );
         let out = train_step(&mut params, &mut state, opt, cfg, &batch, eps, lease.lr * scale, 1.0).await;
         if !out.loss.is_finite() {
             return Err(format!("step {s}: loss is not finite"));
@@ -202,4 +205,61 @@ pub async fn train_lease(lease: &Lease, device: &Device, cache: &mut OptCache, r
         d_shared,
         d_block,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{bench::random_params, block_on};
+
+    fn tiny_lease() -> Lease {
+        let cfg = Cfg { d: 8, heads: 2, layers_per_block: 1, blocks: 2, experts: 2, ffn: 12, ctx: 4, ..Cfg::live() };
+        let named = random_params(&cfg, &mut Rng::new(5));
+        let block_state = named
+            .iter()
+            .filter_map(|(name, value)| name.strip_prefix("block.").map(|name| (name.to_string(), value.clone())))
+            .collect();
+        let shared = named
+            .into_iter()
+            .filter_map(|(name, value)| name.strip_prefix("shared.").map(|name| (name.to_string(), value)))
+            .collect();
+        Lease {
+            version: "test".into(),
+            lease: "seeded-replay".into(),
+            block: 0,
+            block_version: 0,
+            cfg,
+            sigmas: vec![0.3397, 1.2, 80.0],
+            steps: 2,
+            batch: 1,
+            lr: 1e-4,
+            ttl: 60.0,
+            shared,
+            block_state,
+            data: vec![7, 65, 110, 116, 33, 32, 7, 65, 110, 116],
+            data_rows: 2,
+            data_cols: 5,
+        }
+    }
+
+    fn replay(lease: &Lease, seed: u64) -> Update {
+        let device = Device::flex();
+        let mut cache = OptCache::new();
+        let mut rng = Rng::new(seed);
+        let opt = AdamW::default();
+        block_on(train_lease(lease, &device, &mut cache, &mut rng, &opt)).unwrap()
+    }
+
+    #[test]
+    fn seeded_replay_controls_sigma_and_gaussian_training_noise() {
+        let lease = tiny_lease();
+        let first = replay(&lease, 123);
+        let same = replay(&lease, 123);
+        assert_eq!(first.losses, same.losses);
+        assert_eq!(first.d_shared, same.d_shared);
+        assert_eq!(first.d_block, same.d_block);
+
+        let different = replay(&lease, 124);
+        assert_ne!(first.d_block, different.d_block);
+    }
 }

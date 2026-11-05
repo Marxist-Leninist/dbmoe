@@ -20,16 +20,27 @@ python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 For CUDA, use the PyTorch installation command appropriate for your GPU and driver from https://pytorch.org/get-started/locally/.
 
-Ask the run owner for a participant token. Store it in a private local file called `worker.token`; do not commit it or share it. Choose a public pseudonym for your worker name, because participation statistics may be visible on the progress page.
+Self-service enrolment is open: no owner approval is needed. On Linux or macOS, the one-command installer downloads the current worker, enrols automatically and starts a bounded one-hour run:
 
 ```sh
+curl -fsSL https://codex.opentransformers.online/dbmoe/join.sh | sh -s -- --threads 2 --hours 1
+```
+
+For manual setup, download the exact currently deployed worker into a new directory. Optionally mint your own token immediately with `enrol`; it is saved privately in `worker.token` with mode `0600` and is not printed. Alternatively, omit `--token` from the worker command and it will enrol itself.
+
+```sh
+curl -fsSL https://codex.opentransformers.online/dbmoe/code -o dbmoe.py
+# Optional: mint your own token now.
+python dbmoe.py enrol --url https://codex.opentransformers.online/dbmoe
 python dbmoe.py worker \
   --url https://codex.opentransformers.online/dbmoe \
   --token @worker.token --name YOUR_PUBLIC_PSEUDONYM \
   --device cpu --threads 2 --hours 1
 ```
 
-Use `--device cuda` for NVIDIA or `--device rocm` for a supported AMD GPU. The default remains CPU; `--device auto` explicitly opts in to selecting an available GPU, otherwise CPU. An explicit GPU request now fails early if unavailable instead of silently training on CPU. `--hours 1` limits participation to approximately one hour, checked between leases. Workers use your machine's compute, electricity and network. Run only on machines you own or are authorized to use. Keep your token private and request revocation from the owner if exposed.
+New enrolment uses a short proof-of-work challenge and per-address limits; the coordinator stores only a hash of the credential. Keep the token private and request revocation if exposed. Choose a public pseudonym for your worker name, because participation statistics may be visible on the progress page. Workers use your machine's compute, electricity and network. Run only on machines you own or are authorized to use.
+
+Use `--device cuda` for NVIDIA or `--device rocm` for a supported AMD GPU. The default remains CPU; `--device auto` explicitly opts in to selecting an available GPU, otherwise CPU. An explicit GPU request now fails early if unavailable instead of silently training on CPU. `--hours 1` limits participation to approximately one hour, checked between leases.
 
 ## AMD GPUs (ROCm)
 

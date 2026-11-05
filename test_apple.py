@@ -11,6 +11,12 @@ from test_dbmoe import tiny_lease
 
 
 class AppleDeviceTests(unittest.TestCase):
+    def setUp(self):
+        # Keep selection tests deterministic even when this suite runs on an Intel host.
+        patcher = mock.patch.object(dbmoe, 'xpu_available', return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def fake_mps(self, built=True, available=True):
         backend = mock.Mock()
         backend.is_built.return_value = built
@@ -141,3 +147,4 @@ class AppleDeviceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

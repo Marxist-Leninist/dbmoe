@@ -24,6 +24,11 @@ def tiny_lease():
 
 
 class DeviceSelectionTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(dbmoe, 'xpu_available', return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def fake_gpu(self, hip=None, available=True, count=2, current=0):
         stack = contextlib.ExitStack()
         stack.enter_context(mock.patch.object(torch.version, 'hip', hip))
@@ -259,4 +264,5 @@ class HardwarePrivacyTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
 

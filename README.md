@@ -1,52 +1,85 @@
 # DiffusionBlocks-MoE (DBMoE)
 
-An experimental, byte-level language model designed for asynchronous training, with CPU, NVIDIA CUDA, AMD ROCm and Apple Mac MPS worker paths. Each worker trains one noise-range block of a small mixture-of-experts model and returns bounded parameter deltas to a coordinator.
+A byte-level language model trained and run by computers anywhere. Each worker trains one noise-range block of a mixture-of-experts model and serves that block for inference, following the recipe of [DiffusionBlocks](https://arxiv.org/abs/2506.14202) (Shing, Koyama and Akiba, ICLR 2026). A block needs no other block's activations or gradients, so machines never have to talk to each other.
 
 - Live progress: https://codex.opentransformers.online/dbmoe/progress
-- Coordinator endpoint: https://codex.opentransformers.online/dbmoe
-- Status: https://codex.opentransformers.online/dbmoe/status
+- Coordinator: https://codex.opentransformers.online/dbmoe
+- Status (JSON): https://codex.opentransformers.online/dbmoe/status
 
-This is an early research project, not a production-ready language model. No quality or benchmark claims are made. This repository contains code, not trained weights or training data.
+This repository holds the code, not trained weights or training data. `dbmoe.py` here is the same file the coordinator serves at `/code`.
 
-## Contribute compute
+## Join
 
-Install PyTorch 2.x and a Python version supported by your chosen PyTorch release in a virtual environment (Python 3.11+ is a good starting point for current releases). For Linux/Windows CPU-only machines (Mac users: use the [macOS instructions](#apple-mac-macos) below):
+One command, on Linux or macOS with Python 3.9+. No account, no token, nobody to ask:
 
 ```sh
-python -m venv .venv
-. .venv/bin/activate
-python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+curl -fsSL https://codex.opentransformers.online/dbmoe/join.sh | sh
 ```
 
-For CUDA, use the PyTorch installation command appropriate for your GPU and driver from https://pytorch.org/get-started/locally/.
+It installs what it needs in `~/dbmoe-worker` and starts. Your worker gets its own credential, saved in `~/.dbmoe`. Ctrl+C stops it and running it again carries on. Options go after `sh -s --`, for example `curl -fsSL https://codex.opentransformers.online/dbmoe/join.sh | sh -s -- --threads 4 --hours 1`. To read the script first, download it with `-o join.sh`.
 
-Anonymous joining is open. No account, manually supplied token, or owner approval is needed. The worker obtains and stores its own private credential automatically.
-
-On Linux or macOS, first download and review the installer. It installs the reviewed worker and CPU PyTorch if needed, then starts participating until you stop it:
+By hand, and on Windows (`py` instead of `python3`, `curl.exe` in PowerShell):
 
 ```sh
-curl -fsSL https://codex.opentransformers.online/dbmoe/join.sh -o join.sh
-less join.sh
-sh join.sh --threads 2
-```
-
-Or download the exact deployed worker and start it directly:
-
-```sh
+python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 curl -fsSL https://codex.opentransformers.online/dbmoe/code -o dbmoe.py
-python dbmoe.py worker --url https://codex.opentransformers.online/dbmoe --device cpu --threads 2
+python3 dbmoe.py worker --threads 4
 ```
 
-Use `py` and `curl.exe` on Windows where appropriate. Install a compatible PyTorch build first. Ctrl+C stops participation. You can choose your own session budget with `--hours 1`; it is optional, not a network-imposed cutoff.
+| Option | What it does |
+| --- | --- |
+| `--device cuda`, `rocm`, `mps` or `auto` | Train on an NVIDIA, AMD or Mac GPU, or pick what's there. The default is CPU. See the sections below. |
+| `--threads N` | CPU threads to use (default 2) |
+| `--hours N` | Stop after about this long, checked between jobs |
+| `--no-serve` | Train only, no inference |
+| `--serve-only` | Inference only, no training |
+| `--no-share-hardware` | Keep your CPU, RAM and GPU off the public worker list |
 
-Active anonymous access renews automatically. There is no daily participant count or lifetime job limit. Work can wait when compute or validation capacity is full. After long inactivity, the worker can rejoin automatically. Credentials are private and should never be posted, committed or copied into screenshots.
+### Many machines, one identity
 
-The worker trains and can serve an inference block. This uses your machine's compute, electricity and network; only join on machines you own or are authorized to use. Inference workers can see prompt bytes routed through their block, so do not send private prompts to a public volunteer network. `--no-serve` opts out of serving. Submitted training updates are checked before merging, but those checks do not guarantee language improvement or protection against every malicious update.
+Mint one token and use it everywhere, so all your machines count as one participant:
 
-**Release synchronization:** the live anonymous worker is currently served at `/dbmoe/code`. The repository's AMD/MPS backend and opt-in hardware extensions are being merged with that newer network protocol. Do not assume an option supported by one revision is available in another; check `python dbmoe.py --help` and `python dbmoe.py worker --help`. The CPU anonymous join flow above has been tested against the live endpoint.
+```sh
+python3 dbmoe.py enrol       # writes worker.token, readable only by you
+# copy worker.token to each machine, then on each one:
+python3 dbmoe.py worker --token @worker.token --name machine-1
+```
 
-In this repository, `--device cpu` remains the default; `cuda` selects NVIDIA, `rocm` selects a supported AMD GPU, and `mps` selects a compatible Mac GPU. `auto` explicitly opts into CUDA/ROCm first, then MPS, otherwise CPU. Explicit GPU requests fail early when unavailable. These backend extensions still need integration into the deployed anonymous worker.
+Give each machine its own `--name`. Keep the token out of GitHub, screenshots and public messages.
 
+### Leave
+
+```sh
+curl -fsSL https://codex.opentransformers.online/dbmoe/leave.sh | sh
+```
+
+Your workers come off the public list and your credential stops working; a worker still running stops by itself. What you already contributed stays in the model, because it can't be separated out. You can rejoin at any time. If you minted your own token, use `python3 dbmoe.py leave --token @worker.token`. Add `--name machine-1` to remove one machine and keep the token.
+
+### What runs on your machine
+
+The worker uses your compute, power and bandwidth, so only join on machines you own or are authorized to use. Workers that serve inference see the bytes of other people's prompts, so nobody should send anything private through the public network.
+
+## How updates are tested
+
+Every update from every computer, including the run owner's, gets the same automatic test before it merges:
+
+1. **It must have learned something.** At full weight, it must lower the loss on text from its own job. Noise and empty uploads fail here.
+2. **It must not do harm.** At the weight it would merge with, it must not make held-out text worse. No worker is ever given that text.
+3. **Damage can't build up.** A block that has drifted more than 5% above its best takes only improvements, however many participants are sending small steps, and a running total catches one participant who keeps doing slight harm.
+
+Updates on a block are tested one at a time, each on the model it would merge into and at the weight it would merge with. Shared parameters go in as a round every 12 updates, and the round gets its own held-out test first.
+
+A refused update isn't merged or counted. Open participants who keep failing are suspended for 6 hours. Inference is checked too: a new volunteer's first hops are recomputed before anyone sees them, a quarter of everyone's hops are spot-checked after that, and workers caught returning wrong numbers stop being used.
+
+The live counts are on the [progress page](https://codex.opentransformers.online/dbmoe/progress) and in `gate` at `/status`.
+
+## Network inference
+
+```sh
+curl -N "https://codex.opentransformers.online/dbmoe/sample?net=1&prompt=The%20&n=32"
+```
+
+Each byte's diffusion chain goes from worker to worker, one hop per block. Workers long-poll for hops, so this works from behind NAT. The reply is a stream of JSON lines naming the anonymous worker behind every hop. If nobody holds a block, or a worker vanishes, the hop is rerouted or the coordinator runs it and says so. A chain stops early once a block is already certain of the next byte. `sampler=top` uses only the top block, one hop per byte.
 
 ## AMD GPUs (ROCm)
 
@@ -63,7 +96,7 @@ python dbmoe.py check-device --device rocm
 
 Expect a nonempty HIP version, GPU availability `True`, and a successful `check-device` result. This runs a tiny synthetic DBMoE forward/backward/AdamW update and checks finite, bounded CPU deltas through safe serialization. It makes no network request, reads no token, and changes no training checkpoint. GPU workers also run this check automatically before their first lease. It does not establish full-size-model memory capacity or long-run stability.
 
-The AMD device-check implementation is in this repository, but integration with the deployed anonymous worker is pending. Do not substitute an older token-requiring worker into the anonymous join instructions. Physical AMD training validation is still required before claiming a tested AMD release.
+Then join with `python3 dbmoe.py worker --device rocm --threads 2 --batch 1`.
 
 Use `--device rocm:1` for the second visible GPU, or `--device cuda:1` on NVIDIA. Each worker uses one GPU; `--threads` controls PyTorch CPU threads. Start with batch 1 when available VRAM is uncertain. A coordinator can limit requested batch sizes, and full-size model weights plus optimizer state must still fit. Reduce the batch if training runs out of memory; a successful tiny check is not a guarantee that a live lease will fit.
 
@@ -81,7 +114,7 @@ MacBook Air/Pro, iMac, Mac mini, Mac Studio and Mac Pro can use the Python worke
 
 Use [Apple's PyTorch installation guide](https://developer.apple.com/metal/pytorch/) and the [PyTorch installation selector](https://pytorch.org/get-started/locally/) for the selected release. Requirements change by release: Apple's guide currently lists Apple silicon and macOS 14+ for its documented stable build. Older releases have different requirements. Do not use the Linux CPU wheel index on macOS, install CUDA/ROCm packages on a Mac, or bypass unsupported-OS checks.
 
-For the MPS checks, use `dbmoe.py` from this GitHub repository in a fresh checkout. This MPS implementation has not yet been merged into the deployed anonymous worker. Do not assume a `/code` download supports MPS, or substitute this older token-based protocol into the live anonymous join flow. Use the live CPU join instructions above until the integrated MPS release is validated.
+Run the checks first:
 
 ```sh
 python3 -m venv .venv
@@ -91,20 +124,17 @@ python dbmoe.py check-device --device cpu
 python dbmoe.py check-device --device mps
 ```
 
-For an isolated coordinator running this same repository revision (see [Local coordinator](#local-coordinator)), a bounded Mac session looks like this. Use its privately configured participant token:
+Then join:
 
 ```sh
-python dbmoe.py worker \
-  --url http://127.0.0.1:8790 \
-  --token @worker.token --name YOUR_PUBLIC_PSEUDONYM \
-  --device mps --threads 2 --steps 2 --batch 1 --hours 0.25
+python dbmoe.py worker --device mps --threads 2 --batch 1 --hours 0.25
 ```
 
-To train on CPU, change `--device mps` to `--device cpu`. An explicit MPS request fails rather than silently selecting CPU. `mps:0` is accepted as the single MPS device; other MPS indexes are rejected. MPS workers automatically run the offline forward/backward/AdamW/CPU-delta check before reading a token or requesting a lease. The implementation avoids `bincount` on MPS releases without that operator. It does not enable PyTorch's CPU fallback environment switch or disable MPS memory safeguards.
+To train on CPU, change `--device mps` to `--device cpu`. An explicit MPS request fails rather than silently selecting CPU. `mps:0` is accepted as the single MPS device; other MPS indexes are rejected. MPS workers automatically run the offline forward/backward/AdamW/CPU-delta check before reading a credential or requesting work. The implementation avoids `bincount` on MPS releases without that operator. It does not enable PyTorch's CPU fallback environment switch or disable MPS memory safeguards.
 
 Keep the machine ventilated, use external power when practical, start with batch 1, and stop with Ctrl-C if the machine gets hot or memory pressure increases. On Apple silicon the GPU shares system memory: the model, gradients, optimizer state and cached optimizers can consume much more memory than the downloaded weights. A tiny successful check does not prove a large lease fits. `--hours` is checked between leases, not a hard timer, so use short steps for a responsive stop. There is no battery/thermal monitor or automatic launch-at-login behavior in this CLI. Running it is an explicit choice to use compute, electricity and network.
 
-With `--share-hardware`, MPS reports the backend, generic `Metal (MPS)` name, CPU architecture, worker thread count, PyTorch version and macOS version. It does not report a guessed chip model or pretend unified memory is dedicated/free VRAM.
+On a Mac the worker list shows the generic `Metal (MPS)` name and no VRAM figure, because the GPU shares system memory.
 
 ## iPhone, iPad and other Apple products
 
@@ -116,11 +146,9 @@ The initial native worker must be foreground-only, start only after an explicit 
 
 Apple TV and Apple Vision Pro would need separate native UI/runtime/device validation. Apple Watch, HomePod, AirPods and accessories are not supported training workers; companion/control use would be a separate feature. No jailbreak, sideloading bypass, developer-account creation or paid Apple membership is required or performed by this change.
 
-## Optional public hardware specs
+## What the public worker list shows
 
-Once the hardware extension is present in the deployed worker, add `--share-hardware` to opt in to publishing self-reported hardware details with your worker statistics: GPU model and rounded total GPU memory, CPU architecture, the number of PyTorch CPU threads assigned to this worker, PyTorch version, and CUDA/ROCm runtime version (macOS version for MPS). MPS reports a generic Metal name and no VRAM figure. Thread count is not the machine's physical core count; GPU memory is not free memory. These reports are supplied by participants, not independently verified inventory.
-
-Without this flag, no detailed hardware report is sent. Device/backend and participation statistics are still sent as before. New workers do not transmit machine hostnames, IP fields, serial numbers or local paths in update payloads; the coordinator/network provider necessarily sees connection IPs. Choose an explicit public pseudonym, or omit `--name` for a random worker label. The coordinator strips legacy host/IP fields from public status and accepts only the documented hardware fields. Restart without the flag to withdraw the report on the next accepted update; prior logs/backups may still retain earlier reports. Older coordinators may ignore this optional metadata, and website display requires coordinator/page support.
+Each worker's card shows its CPU model, core and thread counts, RAM, GPU model and memory, operating system and PyTorch version, as the worker reports them, plus the speed the coordinator measures. The worker prints exactly what it is sharing when it starts. No hostname, address, serial number or path is sent, and workers appear under an anonymous ID. `--no-share-hardware` keeps the hardware off the list, and the next accepted update removes an earlier report.
 
 ## Tests
 
@@ -133,18 +161,18 @@ python dbmoe.py check-device --device rocm
 python dbmoe.py check-device --device mps
 ```
 
-The unit suite covers CPU training, optimizer-state reuse, coordinator delta validation, portable serialization, CPU/CUDA/ROCm/MPS device selection and privacy behavior. GPU selection is mocked where hardware is absent. Real CUDA/ROCm and MPS tests are explicitly skipped when that backend is unavailable. CPU tests passed on PyTorch 2.6.0+cpu; actual Apple, AMD and NVIDIA hardware validation remains pending.
+The unit suite covers CPU training, optimizer-state reuse, the update test, coordinator delta validation, portable serialization, CPU/CUDA/ROCm/MPS device selection and privacy behavior. GPU selection is mocked where hardware is absent. Real CUDA/ROCm and MPS tests are explicitly skipped when that backend is unavailable. CPU tests passed on PyTorch 2.6.0+cpu; actual Apple, AMD and NVIDIA hardware validation remains pending.
 
 ## How it works
 
-- Byte vocabulary of 256 with tied embedding/output weights.
-- Six blocks by default, each with two causal transformer layers and a top-1, four-expert feed-forward network.
-- Width 256, four attention heads and context length 256 by default.
-- Each block learns a separate diffusion-noise interval; workers need not exchange intermediate activations.
-- Workers receive leases over HTTPS and return parameter deltas; the coordinator validates tensor keys, shapes, finite values and delta bounds before merging.
-- Payload loading uses `torch.load(..., weights_only=True)`.
-
-Validation is not a guarantee against malicious training updates. The current authenticated coordinator should be treated as experimental infrastructure.
+- Byte vocabulary of 256 with tied embedding and output weights. By default, six blocks of two causal transformer layers with a top-1, four-expert feed-forward network, width 256, four attention heads and context length 256.
+- What is noised is the embedding of the next byte. Each block learns its own slice of a log-normal noise distribution, widened by the paper's overlap, with EDM preconditioning and weighting.
+- Generation runs the blocks as a diffusion sampler for the next byte, one Euler step per block, so a byte costs one pass through the layers.
+- Workers receive jobs over HTTPS and return parameter deltas. Merging is asynchronous averaging. Shared parameters (embedding, positions) define the target every block denoises toward, so their deltas are banked and go in together every 12 updates.
+- Compute goes where it's needed: low-noise blocks can read the target off their input, so more updates teach them little, and the blocks with most left to learn get the most work.
+- Workers keep Adam's per-parameter scale between jobs on a block and drop its momentum, which points where the old weights wanted to go.
+- Evaluation measures the chain at each depth and scores generated text against the statistics of real text, because block losses alone can't show whether generation works.
+- Payloads load with `torch.load(..., weights_only=True)`, so nothing a participant sends can run code.
 
 ## Local coordinator
 
@@ -155,7 +183,7 @@ python dbmoe.py coord --dir run --host 127.0.0.1 \
   --text-file training.txt --tokens tokens.json
 ```
 
-Create `tokens.json` privately as a JSON object mapping randomly generated participant tokens to participant labels. Never commit it. Do not expose an unauthenticated coordinator. Internet-facing deployments require TLS, access controls and operational hardening.
+Create `tokens.json` privately as a JSON object mapping randomly generated participant tokens to participant labels, and never commit it. Anyone can enrol through `/join` unless you pass `--no-open-join`. Put TLS in front of anything facing the internet.
 
 ## Sample a checkpoint
 

@@ -247,7 +247,7 @@ class HardwarePrivacyTests(unittest.TestCase):
                     calls.append(dbmoe.from_bytes(body))
                 return dbmoe.to_bytes(L) if method == 'GET' else b'{"ok":true}'
             a = argparse.Namespace(threads=1, device='cpu', url='https://example.invalid', token='test-only',
-                                   name='test', hours=0, steps=2, batch=1, once=1, share_hardware=opted_in)
+                                   name='test', hours=0, steps=2, batch=1, once=1, no_share_hardware=not opted_in)
             with self.subTest(opted_in=opted_in), \
                  mock.patch.object(dbmoe, 'train_lease', return_value=dict(up)), \
                  mock.patch.object(dbmoe, 'http', side_effect=http), contextlib.redirect_stdout(io.StringIO()):

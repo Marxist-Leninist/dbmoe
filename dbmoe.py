@@ -2,12 +2,13 @@
 """dbmoe.py -- a small DiffusionBlocks-MoE byte-level language model trained across many machines.
 
 OpenTransformers / AGILLM-4 lineage (block sigma partition, EDM preconditioning and loss weight ported from
-AGILLM-4 dblocks_train.py).  One file; workers need only PyTorch (CPU or CUDA).
+AGILLM-4 dblocks_train.py).  One file; workers need only PyTorch (CPU, NVIDIA CUDA or AMD ROCm).
 
   coordinator  python dbmoe.py coord --dir RUN --host 127.0.0.1 --port 8790 --tokens tokens.json \
                    --hf "HuggingFaceFW/fineweb-edu:sample/10BT/*.parquet"
   worker       python dbmoe.py worker --url https://codex.opentransformers.online/dbmoe --token TOKEN --name NAME \
-                   [--device cpu|cuda] [--threads 2] [--steps 40] [--batch 8]
+                   [--device cpu|cuda|rocm|auto] [--threads 2] [--steps 40] [--batch 8]
+  check        python dbmoe.py check-device --device rocm  # offline forward/backward and wire-format test
   sample       python dbmoe.py sample --ckpt RUN/master.pt --prompt "The " [--n 200] [--mode chain|top]
   eval         python dbmoe.py eval --ckpt RUN/master.pt --heldout RUN/heldout.pt
 
@@ -38,7 +39,7 @@ asynchronous delta averaging: block += d_block / (leases that overlapped on that
 (all overlapping leases).  New people join by running the worker with a token; tokens.json is re-read when it
 changes.  GET status (JSON), GET sample?prompt=..&n=..&mode=chain|top (text), GET code (this file), GET / (join page).
 """
-import argparse, io, json, math, os, random, secrets, socket, sys, threading, time, urllib.error, urllib.parse, urllib.request
+import argparse, io, json, math, os, platform, random, secrets, socket, sys, threading, time, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import torch
@@ -46,7 +47,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 SD = 0.5
-VERSION = 'dbmoe-v2-20261105'
+VERSION = 'dbmoe-v2-20261105-rocm'
 LN2 = math.log(2)
 
 
@@ -384,10 +385,13 @@ between them; only the trained block (about {mb:.0f} MB) goes back to the coordi
 
   updates {updates:,}   training bytes {tokens:,}   active workers {active}   AR bits/byte {bpb}
 
-Join (any computer with Python 3.9+ and PyTorch; a GPU is optional):
+Join (Python and PyTorch versions compatible with your platform; a GPU is optional):
   python3 -m pip install torch            # CPU build is fine:  --index-url https://download.pytorch.org/whl/cpu
   curl -fsSL {base}/code -o dbmoe.py
-  python3 dbmoe.py worker --url {base} --token YOUR_TOKEN --name YOUR_NAME [--device cuda] [--threads 4]
+  python3 dbmoe.py worker --url {base} --token YOUR_TOKEN --name YOUR_NAME [--device cpu|cuda|rocm] [--threads 4]
+AMD GPUs need a compatible ROCm-enabled PyTorch build, driver and supported GPU/OS combination.
+Install guide: https://github.com/Marxist-Leninist/dbmoe#amd-gpus-rocm
+Offline GPU check: python3 dbmoe.py check-device --device rocm
 Ask the run owner for a token.  Live status: {base}/status     Sample text: {base}/sample?prompt=The%20&n=120
 """
 
@@ -544,9 +548,14 @@ class Coordinator:
             wall = time.time() - L['t0']
             w = m['workers'].setdefault(worker, dict(updates=0, tokens=0, seconds=0.0))
             w.update(updates=w['updates'] + 1, tokens=w['tokens'] + toks, seconds=round(w['seconds'] + sec, 1), last=now(),
-                     last_block=b, host=str(up.get('host', ''))[:64], device=str(up.get('device', ''))[:32],
+                     last_block=b, device=str(up.get('device', ''))[:32],
                      tok_s=round(toks / max(sec, 1e-6), 1), steps=L['steps'],
                      wall_s=round(wall if not w.get('wall_s') else 0.7 * w['wall_s'] + 0.3 * wall, 1))
+            w.pop('host', None)                           # do not retain legacy machine hostnames
+            w.pop('hardware', None)                       # omission withdraws the previous public report
+            hardware = normalize_hardware(up.get('hardware'))
+            if hardware:
+                w['hardware'] = hardware
             self.log(ev='update', lease=up['lease'], block=b, worker=worker, same=L['same'], all=L['all'],
                      ce_first=losses[0] if losses else None, ce_last=lo, tokens=toks, seconds=round(sec, 2),
                      tok_s=round(toks / max(sec, 1e-6), 1))
@@ -597,7 +606,9 @@ class Coordinator:
                         rejected=m['rejected'], block_updates=m['block_updates'], block_ce=m['block_ce'],
                         active_leases=[dict(block=v['block'], worker=v['worker'], age_s=round(time.time() - v['t0']))
                                        for v in self.leases.values()],
-                        workers=m['workers'], last_eval=(m['evals'][-1] if m['evals'] else None),
+                        workers={name: {k: v for k, v in w.items() if k not in ('host', 'ip')}
+                                 for name, w in m['workers'].items()},
+                        last_eval=(m['evals'][-1] if m['evals'] else None),
                         eval_history=[dict(updates=e['updates'], t=e.get('t'), ar_bpb=e['ar_bits_per_byte']) for e in m['evals']],
                         data=dict(source=m.get('data_source'), docs=self.data.docs, buffered_mb=round(len(self.data.buf) / 2**20, 1),
                                   error=self.data.err),
@@ -712,6 +723,118 @@ def serve(a):
 
 
 # ------------------------------------------------------------------------------------------------------------- worker
+def normalize_hardware(value):
+    """Allowlist optional public, self-reported specs. Never forward arbitrary client metadata."""
+    if not isinstance(value, dict) or type(value.get('schema')) is not int or value['schema'] != 1:
+        return None
+    if value.get('self_reported') is not True:
+        return None
+    if not isinstance(value.get('backend'), str) or value['backend'] not in ('cpu', 'cuda', 'rocm'):
+        return None
+    out = dict(schema=1, self_reported=True, backend=value['backend'])
+    for key in ('cpu_arch', 'torch_version', 'runtime_version', 'gpu_name'):
+        text = value.get(key)
+        if isinstance(text, str):
+            out[key] = ''.join(c for c in text if c.isprintable()).strip()[:80]
+    threads = value.get('cpu_threads')
+    if type(threads) is int and 1 <= threads <= 4096:
+        out['cpu_threads'] = threads
+    memory = value.get('gpu_memory_gib')
+    if type(memory) in (int, float) and 0 < memory <= 65536:
+        out['gpu_memory_gib'] = round(float(memory), 1)
+    return out
+
+
+def worker_hardware(device_info, threads):
+    """Called only after --share-hardware opt-in. No hostnames, IPs, serials or filesystem paths."""
+    backend = device_info['backend']
+    report = dict(schema=1, self_reported=True, backend=backend, cpu_arch=platform.machine(),
+                  cpu_threads=max(1, threads), torch_version=str(torch.__version__),
+                  runtime_version=str(torch.version.hip if backend == 'rocm' else
+                                      torch.version.cuda if backend == 'cuda' else ''))
+    if backend != 'cpu':
+        report['gpu_name'] = device_info['gpu_name']
+        report['gpu_memory_gib'] = torch.cuda.get_device_properties(device_info['torch_device']).total_memory / 2**30
+    return normalize_hardware(report)
+
+
+def resolve_worker_device(requested):
+    """Resolve public device names without changing the CPU-default participation policy.
+
+    ROCm PyTorch intentionally exposes AMD devices through torch.cuda / cuda:N.
+    The public label identifies the real backend, including for legacy --device cuda.
+    An explicit GPU request must never silently start a CPU worker.
+    """
+    spec = str(requested).strip().lower()
+    if spec == 'auto':
+        spec = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if spec == 'cpu':
+        return dict(torch_device='cpu', device='cpu', backend='cpu')
+    kind, sep, index = spec.partition(':')
+    if kind not in ('cuda', 'rocm', 'hip') or (sep and (not index.isascii() or not index.isdigit())):
+        raise ValueError('device must be cpu, auto, cuda[:N], or rocm[:N] (hip is an alias for rocm)')
+    hip = getattr(torch.version, 'hip', None)
+    if kind in ('rocm', 'hip') and not hip:
+        raise RuntimeError('AMD ROCm requested, but this PyTorch build has no HIP support. '
+                           'Install ROCm-enabled PyTorch for your supported GPU/OS; see README.md. '
+                           'Use --device cpu explicitly for CPU training.')
+    if not torch.cuda.is_available():
+        raise RuntimeError(f'{kind} requested, but PyTorch cannot access a GPU. Check the PyTorch build, '
+                           'GPU/OS support, driver, and device permissions. Use --device cpu for CPU training.')
+    count = torch.cuda.device_count()
+    idx = int(index) if sep else torch.cuda.current_device()
+    if idx >= count:
+        raise ValueError(f'GPU index {idx} is out of range: PyTorch sees {count} device(s)')
+    backend = 'rocm' if hip else 'cuda'
+    return dict(torch_device=f'cuda:{idx}', device=f'{backend}:{idx}', backend=backend)
+
+
+def device_smoke_test(device):
+    """Train a tiny synthetic lease locally, then verify portable CPU deltas. No network or token required."""
+    cfg = make_cfg(dict(d=16, heads=2, layers_per_block=1, blocks=2, experts=2, ffn=32, ctx=8))
+    shared, block = Shared(cfg), Block(cfg)
+    L = dict(cfg=cfg, block=0, block_version=0, sigmas=cfg_sigmas(cfg), lease='offline-device-check',
+             shared=shared.state_dict(), block_state=block.state_dict(), steps=2, batch=1, lr=1e-3,
+             data=torch.arange(18, dtype=torch.uint8).reshape(2, 9))
+    up = from_bytes(to_bytes(train_lease(L, device)))
+    if not all(math.isfinite(v) for v in up['losses']):
+        raise RuntimeError('device check produced non-finite losses')
+    for delta, ref in ((up['d_shared'], L['shared']), (up['d_block'], L['block_state'])):
+        if set(delta) != set(ref):
+            raise RuntimeError('device check returned incompatible parameter keys')
+        for k, t in delta.items():
+            if t.device.type != 'cpu' or t.dtype != torch.float32 or t.shape != ref[k].shape:
+                raise RuntimeError(f'device check returned an incompatible delta: {k}')
+            if not bool(torch.isfinite(t).all()) or float(t.abs().max()) > 3.5 * L['lr'] * L['steps'] + 1e-6:
+                raise RuntimeError(f'device check returned an invalid delta: {k}')
+    return up['losses']
+
+
+def prepare_worker_device(requested, check_cpu=False):
+    info = resolve_worker_device(requested)
+    device = info['torch_device']
+    if info['backend'] != 'cpu':
+        torch.cuda.set_device(device)
+        info['gpu_name'] = torch.cuda.get_device_name(device)
+    if check_cpu or info['backend'] != 'cpu':
+        try:
+            info['check_losses'] = device_smoke_test(device)
+        except Exception as e:
+            raise RuntimeError(f'{info["device"]} failed the offline training check: {e}. '
+                               'Check your GPU/driver/PyTorch support before joining; see README.md.') from e
+    return info
+
+
+def check_device_cmd(a):
+    torch.set_num_threads(max(1, a.threads))
+    try:
+        info = prepare_worker_device(a.device, check_cpu=True)
+    except (ValueError, RuntimeError) as e:
+        raise SystemExit(f'[check-device] {e}') from e
+    print(json.dumps(dict(ok=True, torch_version=torch.__version__, hip_version=torch.version.hip,
+                          cuda_version=torch.version.cuda, **info), indent=2))
+
+
 def http(method, url, token, body=None, timeout=900):
     req = urllib.request.Request(url, data=body, method=method, headers={'Authorization': f'Bearer {token}',
                                                                           'Content-Type': 'application/octet-stream',
@@ -773,12 +896,18 @@ def worker(a):
         torch.set_num_interop_threads(1)
     except RuntimeError:
         pass
+    try:
+        device_info = prepare_worker_device(a.device)
+    except (ValueError, RuntimeError) as e:
+        raise SystemExit(f'[worker] {e}') from e
+    device = device_info['torch_device']
+    hardware = worker_hardware(device_info, a.threads) if getattr(a, 'share_hardware', False) else None
     base = a.url.rstrip('/')
     if a.token.startswith('@'):                         # --token @FILE keeps the token out of `ps` output
         a.token = open(os.path.expanduser(a.token[1:])).read().strip()
-    device = a.device if (a.device != 'cuda' or torch.cuda.is_available()) else 'cpu'
     host = socket.gethostname()
-    print(f'[worker] {VERSION} {a.name}@{host} -> {base}  device={device} threads={a.threads}', flush=True)
+    print(f'[worker] {VERSION} {a.name}@{host} -> {base}  device={device_info["device"]} '
+          f'torch_device={device} gpu={device_info.get("gpu_name", "none")} threads={a.threads}', flush=True)
     backoff, done, opt_cache = 5, 0, {}
     t_end = time.time() + a.hours * 3600 if a.hours else None
     q = urllib.parse.urlencode(dict(name=a.name, steps=a.steps or '', batch=a.batch or '', session=secrets.token_hex(6)))
@@ -788,7 +917,9 @@ def worker(a):
             L = from_bytes(http('GET', f'{base}/lease?{q}', a.token))
             t1 = time.time()
             up = train_lease(L, device, opt_cache)
-            up.update(name=a.name, host=host, device=device)
+            up.update(name=a.name, device=device_info['device'])
+            if hardware:
+                up['hardware'] = hardware
             body = to_bytes(up)
             t2 = time.time()
             r = json.loads(http('POST', f'{base}/update', a.token, body))
@@ -849,13 +980,20 @@ def main():
     w = sp.add_parser('worker')
     w.add_argument('--url', required=True)
     w.add_argument('--token', required=True, help='bearer token, or @FILE to read it from a file')
-    w.add_argument('--name', default=socket.gethostname())
-    w.add_argument('--device', default='cpu')
+    w.add_argument('--name', default='worker-' + secrets.token_hex(3),
+                   help='public pseudonym (default: random worker label, never the hostname)')
+    w.add_argument('--device', default='cpu', help='cpu (default), auto, cuda[:N], or rocm[:N] for AMD; '
+                   'explicit GPU requests fail if unavailable, rather than falling back to CPU')
     w.add_argument('--threads', type=int, default=2)
+    w.add_argument('--share-hardware', action='store_true', help='opt in to public self-reported GPU model/memory, '
+                   'CPU architecture/worker threads, and PyTorch/runtime versions; no hostname or IP')
     w.add_argument('--steps', type=int, default=0, help='steps per lease (0 = coordinator default)')
     w.add_argument('--batch', type=int, default=0, help='windows per step (0 = coordinator default)')
     w.add_argument('--hours', type=float, default=0, help='stop after this many hours (0 = run forever)')
     w.add_argument('--once', type=int, default=0, help='stop after this many leases (tests)')
+    d = sp.add_parser('check-device', help='offline tiny training and serialization test; no token or network')
+    d.add_argument('--device', default='cpu', help='cpu, auto, cuda[:N], or rocm[:N]')
+    d.add_argument('--threads', type=int, default=2)
     for name in ('sample', 'eval'):
         s = sp.add_parser(name)
         s.add_argument('--ckpt', required=True)
@@ -869,8 +1007,10 @@ def main():
         else:
             s.add_argument('--heldout', required=True)
     a = p.parse_args()
-    dict(coord=serve, worker=worker, sample=sample_cmd, eval=eval_cmd)[a.cmd](a)
+    {'coord': serve, 'worker': worker, 'sample': sample_cmd, 'eval': eval_cmd,
+     'check-device': check_device_cmd}[a.cmd](a)
 
 
 if __name__ == '__main__':
     main()
+

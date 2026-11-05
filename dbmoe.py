@@ -758,6 +758,20 @@ def gate_measure(cfg, sigmas, x, b, o, sh_sd, b_sd, o_sd, d_shared, d_block, w_s
     return before, gate_loss(cfg, sigmas, x, b, shared, block), o_before, gate_loss(cfg, sigmas, x, o, shared, other)
 
 
+@torch.no_grad()
+def gate_learning_measure(cfg, sigmas, x, b, sh_sd, b_sd, d_shared, d_block, w_shared, w_block):
+    """Measure learning on a retained sample of this lease at the exact proposed merge weights."""
+    shared, block = Shared(cfg), Block(cfg)
+    shared.load_state_dict(sh_sd), block.load_state_dict(b_sd)
+    shared.eval(), block.eval()
+    before = gate_loss(cfg, sigmas, x, b, shared, block)
+    for k, p in shared.state_dict().items():
+        p.add_(d_shared[k].to(p.dtype), alpha=w_shared)
+    for k, p in block.state_dict().items():
+        p.add_(d_block[k].to(p.dtype), alpha=w_block)
+    return before, gate_loss(cfg, sigmas, x, b, shared, block)
+
+
 def encode_floats(t):
     return base64.b64encode(array.array('f', t.detach().float().reshape(-1).tolist()).tobytes()).decode()
 
@@ -813,7 +827,7 @@ class NetInfer:
             sid = max(int(time.time()), (self.current or 0) + 1)
             self.snaps[sid] = dict(id=sid, model=m, updates=updates, t=time.time(), blobs={})
             self.current = sid
-            while len(self.snaps) > 2:
+            while len(self.snaps) > 1:                 # one full model in RAM, not a second 1.6B copy
                 self.snaps.popitem(last=False)
             for slot in self.idle.values():             # wake parked workers so they can pick up the new weights
                 slot.event.set()
@@ -1185,7 +1199,8 @@ class Coordinator:
         else:
             self.gate_x = self.data.windows(a.gate_windows, self.model.cfg['ctx'])
             torch.save(self.gate_x, gp)
-        self.gate_all, self.gate_tol = a.gate_all, a.gate_tol
+        self.gate_all, self.gate_tol = True, a.gate_tol
+        self.learn_margin = max(0.0, float(getattr(a, 'learn_margin', 0.0)))
         tp = os.path.join(self.dir, 'teacher.pt')       # about 4 MB of real text; only its n-gram statistics are used
         if os.path.exists(tp):
             tx = torch.load(tp, weights_only=True)
@@ -1318,6 +1333,9 @@ class Coordinator:
             lid = secrets.token_hex(8)
             self.leases[lid] = dict(block=b, worker=worker, owner=owner, client=client, session=session, t0=time.time(), ttl=ttl, steps=steps, batch=batch,
                                     same=active[b] + 1, all=len(self.leases) + 1)
+            probe_rng = torch.Generator().manual_seed(secrets.randbits(63))
+            probe_idx = torch.randperm(data.size(0), generator=probe_rng)[:min(8, data.size(0))]
+            self.leases[lid]['validation_data'] = data[probe_idx].clone()
             payload = dict(version=VERSION, lease=lid, block=b, block_version=bu[b], cfg=self.model.cfg, sigmas=self.model.sigmas,
                            shared={k: v.clone() for k, v in self.model.shared.state_dict().items()},
                            block_state={k: v.clone() for k, v in self.model.blocks[b].state_dict().items()},
@@ -1335,8 +1353,7 @@ class Coordinator:
         return [max(0.25, c * B / sum(ev)) for c in ev]
 
     def _bank_shared(self, b, d):
-        """Shared parameters define the target every block denoises toward, so they must not drift under one block's
-        gradients between other blocks' leases.  Deltas wait here and apply together as one round, weighted by block_weights()."""
+        """Bank shared deltas, then test and apply the exact round at its actual merge, separately from block updates."""
         bank = self.shared_bank.setdefault(b, dict(n=0, sum={k: torch.zeros_like(v) for k, v in d.items()}))
         bank['n'] += 1
         for k, v in d.items():
@@ -1344,18 +1361,45 @@ class Coordinator:
         if sum(v['n'] for v in self.shared_bank.values()) < self.shared_round:
             return
         wt = self.block_weights()
-        for k, p in self.model.shared.state_dict().items():
-            for i, v in self.shared_bank.items():
-                p.add_(v['sum'][k].to(p.dtype), alpha=wt[i] / sum(wt) / v['n'])
+        merged = {}
+        for i, v in self.shared_bank.items():
+            alpha = wt[i] / sum(wt) / v['n']
+            for k, value in v['sum'].items():
+                if k not in merged:
+                    merged[k] = torch.zeros_like(value)
+                merged[k].add_(value, alpha=alpha)
+        o = (b + 1) % self.model.cfg['blocks']
+        sh = {k: v.clone() for k, v in self.model.shared.state_dict().items()}
+        bs = {k: v.clone() for k, v in self.model.blocks[b].state_dict().items()}
+        xs = {k: v.clone() for k, v in self.model.blocks[o].state_dict().items()}
+        zero_block = {k: torch.zeros_like(v) for k, v in bs.items()}
+        learned_before, learned_after = gate_learning_measure(self.model.cfg, self.model.sigmas, self.gate_x, b, sh, bs,
+                                                              merged, zero_block, 1.0, 0.0)
+        before, after, o_before, o_after = gate_measure(self.model.cfg, self.model.sigmas, self.gate_x, b, o, sh, bs, xs,
+                                                        merged, zero_block, 1.0, 0.0)
+        tol, slack = (0.0, 0.0) if self.gate_strict else (self.gate_tol, 0.01)
+        learned = math.isfinite(learned_after) and learned_after < learned_before * (1.0 - self.learn_margin)
+        ok = learned and math.isfinite(after) and math.isfinite(o_after) and after <= before * (1 + tol) + slack and o_after <= o_before * (1 + tol) + slack
+        self.log(ev='shared_gate', block=b, other=o, before=round(before, 5), after=round(after, 5),
+                 other_before=round(o_before, 5), other_after=round(o_after, 5), learned_before=round(learned_before, 5),
+                 learned_after=round(learned_after, 5), learned=learned, ok=ok)
         self.shared_bank.clear()
+        if not ok:
+            self.meta['rejected'] += 1
+            return
+        for k, p in self.model.shared.state_dict().items():
+            p.add_(merged[k].to(p.dtype))
         self.meta['shared_rounds'] = self.meta.get('shared_rounds', 0) + 1
 
     def _check(self, up, L):
         # Validate every field used after merging before touching parameters or counters.
         losses = up.get('losses')
         sec = up.get('seconds')
-        if not isinstance(losses, list) or not 1 <= len(losses) <= L['steps']:
-            return 'losses: expected a bounded nonempty list'
+        if not isinstance(losses, list) or len(losses) != L['steps']:
+            return 'losses: expected one finite loss for every completed lease step'
+        expected_tokens = int(L['steps'] * L['batch'] * self.model.cfg['ctx'])
+        if 'tokens' in up and (type(up['tokens']) is not int or up['tokens'] != expected_tokens):
+            return 'tokens: count differs from the completed lease'
         if any(type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 1e6 for v in losses):
             return 'losses: expected finite numbers between zero and 1e6'
         if type(sec) not in (int, float) or not math.isfinite(sec) or not 0 < sec <= 86400:
@@ -1363,7 +1407,7 @@ class Coordinator:
         if any(not isinstance(up.get(k, ''), str) for k in ('host', 'device', 'name')):
             return 'worker metadata: expected strings'
         lim = 3.5 * self.lr * L['steps'] + 1e-6
-        b = L['block']
+        b, changed = L['block'], False
         for name, ref, d in (('block', self.model.blocks[b].state_dict(), up.get('d_block')),
                              ('shared', self.model.shared.state_dict(), up.get('d_shared'))):
             if not isinstance(d, dict) or set(d) != set(ref):
@@ -1376,6 +1420,15 @@ class Coordinator:
                 m = float(t.abs().max()) if t.numel() else 0.0
                 if m > lim:
                     return f'{name}.{k}: max|delta| {m:.3g} > {lim:.3g}'
+                changed = changed or m > 0.0
+                if t.numel() >= 16:
+                    flat = t.abs().reshape(-1)
+                    saturated = float((flat >= 0.95 * lim).float().mean())
+                    rms = float(flat.square().mean().sqrt()) / max(lim, 1e-12)
+                    if saturated > 0.05 or rms > 0.85:
+                        return f'{name}.{k}: coordinated delta saturation (would make held-out quality worse)'
+        if not changed:
+            return 'empty update: no model parameter changed'
         return None
 
     def gate_update(self, worker, owner, up):
@@ -1392,15 +1445,30 @@ class Coordinator:
             sh = {k: v.clone() for k, v in self.model.shared.state_dict().items()}
             bs = {k: v.clone() for k, v in self.model.blocks[b].state_dict().items()}
             xs = {k: v.clone() for k, v in self.model.blocks[o].state_dict().items()}
+        trained = L.get('validation_data')
+        if trained is None:
+            return 409, dict(ok=False, error='lease predates learning validation; request fresh work')
+        # Only this block merges now; banked shared deltas are tested again at their actual round commit.
+        zero_shared = {k: torch.zeros_like(v) for k, v in up['d_shared'].items()}
+        trained = L.get('validation_data')
+        if trained is None:
+            return 409, dict(ok=False, error='lease predates learning validation; request fresh work')
+        learned_before, learned_after = gate_learning_measure(self.model.cfg, self.model.sigmas, trained.clone(), b, sh, bs,
+                                                              zero_shared, up['d_block'], w_shared, w_block)
+        margin = self.learn_margin * min(w_shared, w_block)
+        learned = math.isfinite(learned_after) and learned_after < learned_before * (1.0 - margin)
+        # Only this block merges now; banked shared deltas are tested again at their actual round commit.
         before, after, o_before, o_after = gate_measure(self.model.cfg, self.model.sigmas, self.gate_x, b, o, sh, bs, xs,
-                                                        up['d_shared'], up['d_block'], w_shared, w_block)
+                                                        zero_shared, up['d_block'], w_shared, w_block)
         tol, slack = (0.0, 0.0) if self.gate_strict else (self.gate_tol, 0.01)   # strict: held-out quality slipped, so only improvements
         worse = after > before * (1 + tol) + slack
         o_worse = o_after > o_before * (1 + tol) + slack
         drift = self.enrol.note_drift(owner, (after - before) / max(before, 0.1)) if self.is_open(owner) else 0.0
-        ok = math.isfinite(after) and math.isfinite(o_after) and not worse and not o_worse and drift <= 0.3
+        ok = learned and math.isfinite(after) and math.isfinite(o_after) and not worse and not o_worse and drift <= 0.3
         self.log(ev='gate', lease=lease, worker=worker, block=b, other=o, before=round(before, 5), after=round(after, 5), other_before=round(o_before, 5),
-                 other_after=round(o_after, 5), w_block=round(w_block, 3), w_shared=round(w_shared, 3), fresh=bool(up.get('fresh_optimizer')), ok=ok)
+                 other_after=round(o_after, 5), w_block=round(w_block, 3), w_shared=round(w_shared, 3),
+                 learned_before=round(learned_before, 5), learned_after=round(learned_after, 5), learned=learned,
+                 learning_margin=margin, fresh=bool(up.get('fresh_optimizer')), ok=ok)
         with self.lock:
             self.meta['gate']['passed' if ok else 'refused'] += 1
             if not ok and self.leases.pop(lease, None) is not None:
@@ -1409,15 +1477,15 @@ class Coordinator:
             self.enrol.strike(owner)
         if ok:
             return {'tested': True}
+        if not learned:
+            return 422, dict(ok=False, error=f'update did not improve its lease training sample ({learned_before:.4f} -> {learned_after:.4f}); not merged')
         return 422, dict(ok=False, error=f'update made held-out loss worse (block {b}: {before:.4f} -> {after:.4f}, block {o}: {o_before:.4f} -> {o_after:.4f}, running {drift:+.3f}); not merged')
 
     def update(self, worker, up):
         owner = worker.split('/', 1)[0]
-        checked = None
-        if self.gate_all or self.is_open(owner):
-            checked = self.gate_update(worker, owner, up)
-            if isinstance(checked, tuple):
-                return checked
+        checked = self.gate_update(worker, owner, up)
+        if isinstance(checked, tuple):
+            return checked
         with self.lock:
             self.expire()
             if not isinstance(up.get('lease'), str) or type(up.get('block')) is not int:
@@ -2123,7 +2191,7 @@ def train_lease(L, device, opt_cache=None):
     if opt_cache is not None:
         opt_cache.pop(b, None)
         opt_cache[b] = (opt.state_dict(), L.get('block_version', 0) + 1)
-        while len(opt_cache) > 2:                          # keep the two most recent blocks
+        while len(opt_cache) > 1:                          # sticky block: one optimizer state is enough and saves RAM
             opt_cache.pop(next(iter(opt_cache)))
     return dict(lease=L['lease'], block=b, losses=ces, seconds=round(sec, 2), tokens=int(S * bs * cfg['ctx']),
                 fresh_optimizer=bool(warm),
@@ -2243,7 +2311,8 @@ def main():
     c.add_argument('--join-per-day', type=int, default=0, help='0: no artificial daily participant limit')
     c.add_argument('--gate-windows', type=int, default=12)
     c.add_argument('--gate-tol', type=float, default=0.10, help='refuse an update that makes held-out loss this fraction worse')
-    c.add_argument('--gate-all', action='store_true', help='also test tokens.json participants (calibration)')
+    c.add_argument('--gate-all', action='store_true', default=True, help='compatibility option: every participant update is always tested')
+    c.add_argument('--learn-margin', type=float, default=0.0, help='relative lease-sample learning margin before merge-weight dilution')
     c.add_argument('--net-refresh', type=float, default=600, help='seconds between inference snapshots')
     t = sp.add_parser('enrol', aliases=['token'], help='optional: mint your own token now and save it privately (the worker also does this by itself)')
     t.add_argument('--url', default=DEFAULT_URL)

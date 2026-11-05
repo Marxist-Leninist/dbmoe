@@ -1,0 +1,50 @@
+[package]
+name = "dbmoe-worker"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "DBMoE block-training worker in Rust (Burn): one static binary, CPU via Flex, any GPU or browser WebGPU via wgpu"
+publish = false
+
+[lib]
+name = "dbmoe_worker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dbmoe-worker"
+path = "src/main.rs"
+
+[dependencies]
+# Flex is Burn's pure-Rust CPU backend (SIMD + rayon); it is the numerical reference the parity test checks.
+burn = { version = "0.22.1", default-features = false, features = ["std", "flex", "autodiff"] }
+libm = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+web-time = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.4"
+rayon = "1"
+sha2 = "0.10"
+ureq = "2"
+
+[features]
+default = []
+# One GPU path for NVIDIA, AMD, Intel and Apple GPUs (Vulkan, DirectX 12 or Metal), and WebGPU in browsers.
+wgpu = ["burn/wgpu"]
+vulkan = ["burn/vulkan"]
+metal = ["burn/metal"]
+webgpu = ["burn/webgpu"]
+# Native NVIDIA and AMD backends (CubeCL); they need the vendor driver and runtime (CUDA, ROCm/HIP) at run time.
+cuda = ["burn/cuda"]
+rocm = ["burn/rocm"]
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+strip = true

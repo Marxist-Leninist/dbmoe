@@ -1,0 +1,185 @@
+name: worker-rs
+
+# The Rust worker: unit and parity tests on Linux, Windows and Apple Silicon; parity against fixtures regenerated
+# from the current dbmoe.py; an end-to-end run against a local coordinator; release binaries (a static Linux one,
+# Windows with a static C runtime, macOS arm64) and the browser (wasm32 + WebGPU) build.
+on:
+  push:
+    branches: [main]
+    paths: ['worker-rs/**', 'dbmoe.py', 'apple/**', 'test_safetensors_wire.py', 'test_rust_worker_loopback.py', '.github/workflows/worker-rs.yml']
+  pull_request:
+    paths: ['worker-rs/**', 'dbmoe.py', 'apple/**', 'test_safetensors_wire.py', 'test_rust_worker_loopback.py', '.github/workflows/worker-rs.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-rs-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      OMP_NUM_THREADS: "2"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: worker-rs
+      - name: Unit and parity tests (CPU)
+        run: cargo test --release --manifest-path worker-rs/Cargo.toml
+      - name: Build the worker
+        run: cargo build --release --manifest-path worker-rs/Cargo.toml
+      - name: Parity with the committed fixture
+        run: worker-rs/target/release/dbmoe-worker parity --fixture apple/parity.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyTorch (CPU build on Linux/Windows) and safetensors
+        run: |
+          python -m pip install --upgrade pip
+          if [ "$RUNNER_OS" = "macOS" ]; then pip install torch; else pip install torch --index-url https://download.pytorch.org/whl/cpu; fi
+          pip install -r requirements.txt safetensors
+      - name: Parity with fixtures regenerated from this dbmoe.py (balanced and skewed routing)
+        run: |
+          python apple/generate_parity_fixture.py --output "$RUNNER_TEMP/parity.json"
+          python apple/generate_parity_fixture.py --skewed --output "$RUNNER_TEMP/parity-skewed.json"
+          worker-rs/target/release/dbmoe-worker parity --fixture "$RUNNER_TEMP/parity.json"
+          worker-rs/target/release/dbmoe-worker parity --fixture "$RUNNER_TEMP/parity-skewed.json"
+      - name: Safetensors wire format, and the Rust worker against a local coordinator
+        run: |
+          exe=worker-rs/target/release/dbmoe-worker
+          if [ "$RUNNER_OS" = "Windows" ]; then exe="$exe.exe"; fi
+          DBMOE_RUST_WORKER="$GITHUB_WORKSPACE/$exe" python -m unittest test_safetensors_wire test_rust_worker_loopback -v
+      - name: Speed on this runner (CPU, 2 threads; informational)
+        run: |
+          worker-rs/target/release/dbmoe-worker bench --threads 2 --steps 3 --warmup 1 --json
+          python worker-rs/bench/torch_step.py --threads 2 --steps 3 --warmup 1
+
+  release:
+    name: binary (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64-static-cpu
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            features: ""
+          - name: linux-x86_64-gpu
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: wgpu
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: wgpu
+            rustflags: -C target-feature=+crt-static
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            features: wgpu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal && rustup default stable
+          rustup target add ${{ matrix.target }}
+      - name: musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: worker-rs
+          key: ${{ matrix.target }}-${{ matrix.features }}
+      - name: Build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          feats=()
+          if [ -n "${{ matrix.features }}" ]; then feats=(--features "${{ matrix.features }}"); fi
+          cargo build --release --locked --manifest-path worker-rs/Cargo.toml --target ${{ matrix.target }} "${feats[@]}"
+      - name: Check and package
+        run: |
+          dir=worker-rs/target/${{ matrix.target }}/release
+          exe=$dir/dbmoe-worker
+          if [ "$RUNNER_OS" = "Windows" ]; then exe="$exe.exe"; fi
+          "$exe" version
+          "$exe" devices
+          "$exe" parity --fixture apple/parity.json
+          if [ "$RUNNER_OS" = "Linux" ]; then file "$exe"; ldd "$exe" || true; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then otool -L "$exe"; fi
+          mkdir -p dist && cp "$exe" dist/
+          (cd dist && for f in dbmoe-worker*; do if command -v sha256sum >/dev/null; then sha256sum "$f"; else shasum -a 256 "$f"; fi; done > ../SHA256SUMS)
+          mv SHA256SUMS dist/ && cat dist/SHA256SUMS
+      - name: The musl binary must be fully static
+        if: contains(matrix.target, 'musl')
+        run: ldd dist/dbmoe-worker 2>&1 | grep -Eq 'not a dynamic executable|statically linked'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dbmoe-worker-${{ matrix.name }}
+          path: dist/
+
+  docker:
+    name: container (static CPU worker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -f worker-rs/Dockerfile -t dbmoe-worker-rs .
+      - name: Parity inside the container, and image size
+        run: |
+          docker run --rm dbmoe-worker-rs parity --fixture /parity.json
+          docker run --rm dbmoe-worker-rs version
+          docker image ls dbmoe-worker-rs --format 'image size: {{.Size}}'
+
+  wasm:
+    name: browser (wasm32 + WebGPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal && rustup default stable
+          rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: worker-rs/web
+      - name: Build the WebAssembly module
+        working-directory: worker-rs/web                # .cargo/config.toml there sets the target and getrandom's backend
+        run: cargo build --release --locked
+      - name: JavaScript bindings
+        working-directory: worker-rs/web
+        run: |
+          version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+          cargo install wasm-bindgen-cli --version "$version" --locked --target x86_64-unknown-linux-gnu
+          wasm-bindgen --target web --no-typescript --out-dir pkg target/wasm32-unknown-unknown/release/dbmoe_web.wasm
+          cp index.html ../../apple/parity.json pkg/
+          ls -la pkg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dbmoe-worker-web
+          path: worker-rs/web/pkg/

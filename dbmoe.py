@@ -62,7 +62,7 @@ byte's logits.  A slow or vanished worker's hop is rerouted; if no worker has a 
 and the reply says so.  Results are spot-checked against the snapshot and workers that lie stop being used.  The reply is
 a stream of JSON lines naming the (anonymous) worker behind every hop.
 """
-import argparse, array, base64, collections, hashlib, hmac, http.client as httpc, io, ipaddress, json, math, os, platform, random, secrets, select, socket, sys, threading, time, urllib.error, urllib.parse, urllib.request
+import argparse, array, base64, collections, hashlib, hmac, http.client as httpc, io, ipaddress, json, math, os, platform, random, re, secrets, select, socket, sys, threading, time, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
@@ -2117,6 +2117,9 @@ def normalize_hardware(value):
     memory = value.get('gpu_memory_gib')
     if type(memory) in (int, float) and 0 < memory <= 65536:
         out['gpu_memory_gib'] = round(float(memory), 1)
+    kind = value.get('gpu_memory_kind')
+    if isinstance(kind, str) and kind in ('shared', 'dedicated', 'unknown'):
+        out['gpu_memory_kind'] = kind
     return out
 
 
@@ -2135,7 +2138,9 @@ def worker_hardware(device_info, threads):
         report['gpu_memory_gib'] = torch.cuda.get_device_properties(device_info['torch_device']).total_memory / 2**30
     elif backend == 'xpu':
         report['gpu_name'] = device_info['gpu_name']
-        report['gpu_memory_gib'] = torch.xpu.get_device_properties(device_info['torch_device']).total_memory / 2**30
+        props = torch.xpu.get_device_properties(device_info['torch_device'])
+        report['gpu_memory_gib'] = props.total_memory / 2**30
+        report['gpu_memory_kind'] = xpu_memory_kind(props)
     elif backend == 'mps':
         report['gpu_name'] = device_info.get('gpu_name', 'Metal (MPS)')
     return normalize_hardware(report)
@@ -2230,7 +2235,37 @@ def device_smoke_test(device):
     return up['losses']
 
 
-def prepare_worker_device(requested, check_cpu=False):
+def xpu_memory_kind(properties):
+    """Use PyTorch's explicit flag; never guess integrated graphics from a GPU name."""
+    integrated = getattr(properties, 'is_integrated_gpu', None)
+    return ('shared' if integrated else 'dedicated') if type(integrated) is bool else 'unknown'
+
+
+def configure_xpu_memory(info, fraction):
+    """Optional process-local allocator cap, not a reservation or a cap on total host RAM."""
+    if fraction is None:
+        return
+    if type(fraction) not in (int, float) or not math.isfinite(fraction) or not 0 < fraction <= 1:
+        raise ValueError('--xpu-memory-fraction must be finite, greater than 0 and at most 1')
+    if info['backend'] != 'xpu':
+        raise ValueError('--xpu-memory-fraction requires an Intel XPU device; use --device xpu[:N]')
+    setter = getattr(torch.xpu, 'set_per_process_memory_fraction', None)
+    if not callable(setter):
+        raise RuntimeError('This PyTorch XPU build cannot enforce --xpu-memory-fraction. '
+                           'Install a compatible current XPU build; the requested cap was not applied.')
+    device = info['torch_device']
+    try:
+        total = torch.xpu.get_device_properties(device).total_memory
+        if type(total) not in (int, float) or not math.isfinite(total) or total <= 0:
+            raise RuntimeError('PyTorch did not report a valid total device memory size')
+        setter(float(fraction), device=device)
+    except Exception as e:
+        raise RuntimeError(f'Cannot apply the requested XPU memory cap on {device}: {e}') from e
+    info['xpu_memory_fraction'] = float(fraction)
+    info['xpu_allocator_limit_gib'] = round(total * fraction / 2**30, 3)
+
+
+def prepare_worker_device(requested, check_cpu=False, xpu_memory_fraction=None):
     info = resolve_worker_device(requested)
     device = info['torch_device']
     if info['backend'] in ('cuda', 'rocm'):
@@ -2239,8 +2274,10 @@ def prepare_worker_device(requested, check_cpu=False):
     elif info['backend'] == 'xpu':
         torch.xpu.set_device(device)
         info['gpu_name'] = torch.xpu.get_device_name(device)
+        info['gpu_memory_kind'] = xpu_memory_kind(torch.xpu.get_device_properties(device))
     elif info['backend'] == 'mps':
         info['gpu_name'] = 'Metal (MPS)'
+    configure_xpu_memory(info, xpu_memory_fraction)
     if check_cpu or info['backend'] != 'cpu':
         try:
             info['check_losses'] = device_smoke_test(device)
@@ -2253,11 +2290,113 @@ def prepare_worker_device(requested, check_cpu=False):
 def check_device_cmd(a):
     torch.set_num_threads(max(1, a.threads))
     try:
-        info = prepare_worker_device(a.device, check_cpu=True)
+        info = prepare_worker_device(a.device, check_cpu=True,
+                                     xpu_memory_fraction=getattr(a, 'xpu_memory_fraction', None))
     except (ValueError, RuntimeError) as e:
         raise SystemExit(f'[check-device] {e}') from e
     print(json.dumps(dict(ok=True, torch_version=torch.__version__, hip_version=torch.version.hip,
                           cuda_version=torch.version.cuda, xpu_version=getattr(torch.version, 'xpu', None), **info), indent=2))
+
+
+def report_version(value):
+    """Only a numeric release/prerelease, never a local build suffix, path or arbitrary text."""
+    match = re.match(r'^(\d+\.\d+(?:\.\d+)?(?:(?:a|b|rc|dev)\d+)?)', str(value))
+    return match.group(1)[:32] if match else 'unknown'
+
+
+def report_device(value):
+    spec = str(value).strip().lower()
+    return spec if re.fullmatch(r'(?:cpu|auto|mps(?::0)?|(?:cuda|rocm|hip|xpu|intel)(?::[0-9]{1,8})?)', spec) else 'invalid'
+
+
+def report_hardware(info):
+    """Explicit opt-in model/capacity only. No arbitrary property or diagnostic dumps."""
+    backend, device = info['backend'], info['torch_device']
+    if backend == 'cpu':
+        return dict(gpu='none')
+    if backend == 'mps':
+        return dict(gpu_model='Metal (MPS)', memory_kind='shared_or_unknown')
+    api = torch.xpu if backend == 'xpu' else torch.cuda
+    try:
+        name = api.get_device_name(device)
+        props = api.get_device_properties(device)
+        # Driver model strings are reviewed by the volunteer before publication.
+        # Reject multiline/path/email-shaped values instead of partially copying them.
+        model = name if isinstance(name, str) and len(name) <= 80 and re.fullmatch(r'[A-Za-z0-9 ()+.,_-]+', name) else 'withheld'
+        out = dict(gpu_model=model, memory_kind=xpu_memory_kind(props) if backend == 'xpu' else 'dedicated_or_unknown')
+        total = props.total_memory
+        if type(total) in (int, float) and math.isfinite(total) and 0 < total <= 65536 * 2**30:
+            out['total_device_memory_gib'] = round(total / 2**30, 1)
+        return out
+    except Exception:
+        return dict(available=False)
+
+
+def hardware_report(requested, threads=2, include_hardware=False, xpu_memory_fraction=None):
+    """Run one offline check and build a local, reviewable report. Never send it anywhere."""
+    os_name, arch = platform.system(), platform.machine().lower()
+    report = dict(schema='dbmoe.hardware-report.v1', report_id=secrets.token_hex(6),
+                  generated_at_utc=time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime()),
+                  dbmoe_version=VERSION, test_scope='tiny_synthetic_offline',
+                  self_reported=True, independently_verified=False,
+                  full_model_capacity_tested=False, network_training_tested=False,
+                  requested_device=report_device(requested),
+                  environment=dict(os_family=os_name if os_name in ('Linux', 'Windows', 'Darwin') else 'other',
+                                   architecture=arch if arch in ('x86_64', 'amd64', 'aarch64', 'arm64', 'x86', 'i386',
+                                                               'i686', 'armv7l', 'ppc64le', 'riscv64') else 'other',
+                                   torch_version=report_version(torch.__version__)),
+                  hardware_opt_in=bool(include_hardware), result='failed', stage='device_selection')
+    try:
+        with open(__file__, 'rb') as source:
+            report['source_sha256'] = hashlib.sha256(source.read()).hexdigest()
+    except OSError:
+        report['source_sha256'] = 'unavailable'
+    selected = None
+    try:
+        if type(threads) is not int or not 1 <= threads <= 4096:
+            raise ValueError('invalid thread count')
+        torch.set_num_threads(threads)
+        selected = resolve_worker_device(requested)
+        report['selected_device'] = selected['device']
+        report['backend'] = selected['backend']
+        report['stage'] = 'offline_preflight'
+        runtime = getattr(torch.version, 'hip' if selected['backend'] == 'rocm' else
+                          'cuda' if selected['backend'] == 'cuda' else 'xpu', None)
+        if selected['backend'] in ('cuda', 'rocm', 'xpu'):
+            report['environment']['runtime_version'] = report_version(runtime)
+        info = prepare_worker_device(selected['torch_device'], check_cpu=True,
+                                     xpu_memory_fraction=xpu_memory_fraction)
+        report.update(result='passed', stage='complete', checks=['forward_backward', 'adamw', 'bounded_cpu_deltas', 'safe_serialization'])
+        if 'xpu_memory_fraction' in info:
+            report['xpu_memory_fraction'] = info['xpu_memory_fraction']
+            if include_hardware:
+                report['xpu_allocator_limit_gib'] = info['xpu_allocator_limit_gib']
+    except ValueError:
+        report['failure_category'] = 'invalid_device_or_options'
+    except RuntimeError:
+        report['failure_category'] = 'backend_unavailable' if report['stage'] == 'device_selection' else 'runtime_or_training_failure'
+    except Exception:
+        report['failure_category'] = 'unexpected_error'
+    if include_hardware and selected is not None:
+        report['hardware'] = report_hardware(selected)
+    return report
+
+
+def hardware_report_cmd(a):
+    report = hardware_report(a.device, threads=a.threads, include_hardware=a.include_hardware,
+                             xpu_memory_fraction=a.xpu_memory_fraction)
+    payload = json.dumps(report, indent=2, allow_nan=False) + '\n'
+    if a.output == '-':
+        print(payload, end='')
+    else:
+        try:
+            with open(os.path.expanduser(a.output), 'x', encoding='utf-8') as destination:
+                destination.write(payload)
+        except OSError:
+            raise SystemExit('[hardware-report] Could not create output; choose an unused writable filename.') from None
+        print('[hardware-report] Saved locally. Review before sharing; nothing was uploaded.')
+    if report['result'] != 'passed':
+        raise SystemExit(1)
 
 
 def token_path(base):
@@ -2521,7 +2660,7 @@ def worker(a):
     except RuntimeError:
         pass
     try:
-        device_info = prepare_worker_device(a.device)
+        device_info = prepare_worker_device(a.device, xpu_memory_fraction=getattr(a, 'xpu_memory_fraction', None))
     except (ValueError, RuntimeError) as e:
         sys.exit(f'[worker] {e}')                       # before any network or credential, so a bad device costs nothing
     device = device_info['torch_device']
@@ -2542,6 +2681,9 @@ def worker(a):
     if hardware:
         print('[worker] shown on the public worker list: ' + ', '.join(f'{k}={v}' for k, v in hardware.items() if k not in ('schema', 'self_reported'))
               + '.  No hostname or address.  --no-share-hardware turns this off.', flush=True)
+    if 'xpu_memory_fraction' in device_info:
+        print(f'[worker] XPU allocator cap {device_info["xpu_allocator_limit_gib"]:.3f} GiB '
+              '(not reserved; host RAM and runtime overhead are outside this cap)', flush=True)
     if getattr(a, 'serve_only', False):
         return serve_hops(a, base)
     if not getattr(a, 'no_serve', True):
@@ -2657,6 +2799,15 @@ def main():
     d = sp.add_parser('check-device', help='offline tiny training and serialization test; no token or network')
     d.add_argument('--device', default='cpu', help='cpu, auto, cuda[:N], rocm[:N], xpu[:N] (intel alias), or mps')
     d.add_argument('--threads', type=int, default=2)
+    r = sp.add_parser('hardware-report', help='opt-in offline compatibility report; local output only, no upload')
+    r.add_argument('--device', default='cpu', help='cpu, auto, cuda[:N], rocm[:N], xpu[:N], or mps')
+    r.add_argument('--threads', type=int, default=2)
+    r.add_argument('--output', default='-', help='new local JSON file, or - for stdout; existing files are never overwritten')
+    r.add_argument('--include-hardware', action='store_true', help='include GPU model and total memory for your review; never uploads them')
+    for parser in (w, d, r):
+        parser.add_argument('--xpu-memory-fraction', type=float, default=None,
+                            help='optional XPU allocator cap as a fraction of reported total device memory '
+                                 '(0 < fraction <= 1); not free memory or a total host-RAM limit')
     w.add_argument('--threads', type=int, default=2)
     w.add_argument('--steps', type=int, default=0, help='steps per lease (0 = coordinator default)')
     w.add_argument('--batch', type=int, default=0, help='windows per step (0 = coordinator default)')
@@ -2678,7 +2829,7 @@ def main():
     if a.cmd == 'worker' and not a.name:
         a.name = stable_worker_name()
     {'coord': serve, 'enrol': enrol_cmd, 'token': enrol_cmd, 'leave': leave_cmd, 'worker': worker, 'sample': sample_cmd, 'eval': eval_cmd,
-     'check-device': check_device_cmd}[a.cmd](a)
+     'check-device': check_device_cmd, 'hardware-report': hardware_report_cmd}[a.cmd](a)
 
 
 if __name__ == '__main__':

@@ -44,7 +44,8 @@ class DeviceSelectionTests(unittest.TestCase):
 
     def test_auto_cpu(self):
         self.fake_gpu(available=False)
-        self.assertEqual(dbmoe.resolve_worker_device('auto')['backend'], 'cpu')
+        with mock.patch.object(dbmoe, 'mps_available', return_value=False):
+            self.assertEqual(dbmoe.resolve_worker_device('auto')['backend'], 'cpu')
 
     def test_nvidia_cuda_and_index(self):
         self.fake_gpu()
@@ -258,3 +259,4 @@ class HardwarePrivacyTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

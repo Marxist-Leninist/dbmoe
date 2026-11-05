@@ -2,12 +2,12 @@
 """dbmoe.py -- a small DiffusionBlocks-MoE byte-level language model trained across many machines.
 
 OpenTransformers / AGILLM-4 lineage (block sigma partition, EDM preconditioning and loss weight ported from
-AGILLM-4 dblocks_train.py).  One file; workers need only PyTorch (CPU, NVIDIA CUDA or AMD ROCm).
+AGILLM-4 dblocks_train.py).  One file; workers need only PyTorch (CPU, NVIDIA CUDA, AMD ROCm or macOS MPS).
 
   coordinator  python dbmoe.py coord --dir RUN --host 127.0.0.1 --port 8790 --tokens tokens.json \
                    --hf "HuggingFaceFW/fineweb-edu:sample/10BT/*.parquet"
   worker       python dbmoe.py worker --url https://codex.opentransformers.online/dbmoe --token TOKEN --name NAME \
-                   [--device cpu|cuda|rocm|auto] [--threads 2] [--steps 40] [--batch 8]
+                   [--device cpu|cuda|rocm|mps|auto] [--threads 2] [--steps 40] [--batch 8]
   check        python dbmoe.py check-device --device rocm  # offline forward/backward and wire-format test
   sample       python dbmoe.py sample --ckpt RUN/master.pt --prompt "The " [--n 200] [--mode chain|top]
   eval         python dbmoe.py eval --ckpt RUN/master.pt --heldout RUN/heldout.pt
@@ -47,7 +47,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 SD = 0.5
-VERSION = 'dbmoe-v2-20261105-rocm'
+VERSION = 'dbmoe-v2-20261105-apple'
 LN2 = math.log(2)
 
 
@@ -95,6 +95,11 @@ def cfg_sigmas(cfg):
     return block_sigmas(cfg['blocks'], cfg['sig_min'], cfg['sig_max'], cfg['sig_pm'], cfg['sig_ps'])
 
 
+def portable_expert_counts(top_i, experts):
+    """Fixed-size expert histogram without bincount, which some MPS builds lack."""
+    return (top_i[:, None] == torch.arange(experts, device=top_i.device)[None, :]).sum(0)
+
+
 class MoE(nn.Module):
     def __init__(self, d, ffn, E):
         super().__init__()
@@ -114,7 +119,13 @@ class MoE(nn.Module):
             if idx.numel():
                 h = F.gelu(flat.index_select(0, idx) @ self.w1[e]) @ self.w2[e]
                 out.index_add_(0, idx, h * top_p.index_select(0, idx)[:, None].to(h.dtype))
-        frac = torch.bincount(top_i, minlength=self.E).float() / max(1, top_i.numel())
+        # bincount is unavailable on some MPS releases. Count the fixed, small expert
+        # set with tensor comparisons instead; the selected expert IDs are unchanged.
+        if top_i.device.type == 'mps':
+            counts = portable_expert_counts(top_i, self.E)
+        else:
+            counts = torch.bincount(top_i, minlength=self.E)
+        frac = counts.float() / max(1, top_i.numel())
         aux = self.E * (frac.detach() * prob.mean(0)).sum()
         return out.reshape(Bsz, T, d), aux, frac
 
@@ -386,12 +397,14 @@ between them; only the trained block (about {mb:.0f} MB) goes back to the coordi
   updates {updates:,}   training bytes {tokens:,}   active workers {active}   AR bits/byte {bpb}
 
 Join (Python and PyTorch versions compatible with your platform; a GPU is optional):
-  python3 -m pip install torch            # CPU build is fine:  --index-url https://download.pytorch.org/whl/cpu
+  python3 -m pip install torch            # macOS: use its native wheel; see platform guides below
   curl -fsSL {base}/code -o dbmoe.py
-  python3 dbmoe.py worker --url {base} --token YOUR_TOKEN --name YOUR_NAME [--device cpu|cuda|rocm] [--threads 4]
+  python3 dbmoe.py worker --url {base} --token YOUR_TOKEN --name YOUR_NAME [--device cpu|cuda|rocm|mps] [--threads 4]
 AMD GPUs need a compatible ROCm-enabled PyTorch build, driver and supported GPU/OS combination.
 Install guide: https://github.com/Marxist-Leninist/dbmoe#amd-gpus-rocm
 Offline GPU check: python3 dbmoe.py check-device --device rocm
+Macs can use --device cpu or --device mps with a compatible macOS/PyTorch installation.
+Mac install/check guide: https://github.com/Marxist-Leninist/dbmoe#apple-mac-macos
 Ask the run owner for a token.  Live status: {base}/status     Sample text: {base}/sample?prompt=The%20&n=120
 """
 
@@ -729,7 +742,7 @@ def normalize_hardware(value):
         return None
     if value.get('self_reported') is not True:
         return None
-    if not isinstance(value.get('backend'), str) or value['backend'] not in ('cpu', 'cuda', 'rocm'):
+    if not isinstance(value.get('backend'), str) or value['backend'] not in ('cpu', 'cuda', 'rocm', 'mps'):
         return None
     out = dict(schema=1, self_reported=True, backend=value['backend'])
     for key in ('cpu_arch', 'torch_version', 'runtime_version', 'gpu_name'):
@@ -751,11 +764,22 @@ def worker_hardware(device_info, threads):
     report = dict(schema=1, self_reported=True, backend=backend, cpu_arch=platform.machine(),
                   cpu_threads=max(1, threads), torch_version=str(torch.__version__),
                   runtime_version=str(torch.version.hip if backend == 'rocm' else
-                                      torch.version.cuda if backend == 'cuda' else ''))
-    if backend != 'cpu':
+                                      torch.version.cuda if backend == 'cuda' else
+                                      platform.mac_ver()[0] if backend == 'mps' else ''))
+    if backend in ('cuda', 'rocm'):
         report['gpu_name'] = device_info['gpu_name']
         report['gpu_memory_gib'] = torch.cuda.get_device_properties(device_info['torch_device']).total_memory / 2**30
+    elif backend == 'mps':
+        # MPS uses shared/unified memory. Do not mislabel system RAM or a recommended
+        # working-set limit as dedicated/free GPU memory, or query CUDA on a Mac.
+        report['gpu_name'] = 'Metal (MPS)'
     return normalize_hardware(report)
+
+
+def mps_available():
+    """Older/non-Apple PyTorch builds may not expose an MPS backend at all."""
+    backend = getattr(torch.backends, 'mps', None)
+    return backend is not None and backend.is_available()
 
 
 def resolve_worker_device(requested):
@@ -767,12 +791,23 @@ def resolve_worker_device(requested):
     """
     spec = str(requested).strip().lower()
     if spec == 'auto':
-        spec = 'cuda' if torch.cuda.is_available() else 'cpu'
+        spec = 'cuda' if torch.cuda.is_available() else 'mps' if mps_available() else 'cpu'
     if spec == 'cpu':
         return dict(torch_device='cpu', device='cpu', backend='cpu')
+    if spec in ('mps', 'mps:0'):
+        backend = getattr(torch.backends, 'mps', None)
+        if backend is None or not backend.is_built():
+            raise RuntimeError('Apple MPS requested, but this PyTorch build has no MPS support. '
+                               'Install compatible macOS PyTorch; see README.md. '
+                               'Use --device cpu explicitly for CPU training.')
+        if not backend.is_available():
+            raise RuntimeError('Apple MPS requested, but PyTorch cannot access an MPS GPU. '
+                               'Check the supported Mac, macOS and PyTorch versions; see README.md. '
+                               'Use --device cpu explicitly for CPU training.')
+        return dict(torch_device='mps', device='mps', backend='mps')
     kind, sep, index = spec.partition(':')
     if kind not in ('cuda', 'rocm', 'hip') or (sep and (not index.isascii() or not index.isdigit())):
-        raise ValueError('device must be cpu, auto, cuda[:N], or rocm[:N] (hip is an alias for rocm)')
+        raise ValueError('device must be cpu, auto, cuda[:N], rocm[:N], or mps (hip is an alias for rocm)')
     hip = getattr(torch.version, 'hip', None)
     if kind in ('rocm', 'hip') and not hip:
         raise RuntimeError('AMD ROCm requested, but this PyTorch build has no HIP support. '
@@ -813,9 +848,11 @@ def device_smoke_test(device):
 def prepare_worker_device(requested, check_cpu=False):
     info = resolve_worker_device(requested)
     device = info['torch_device']
-    if info['backend'] != 'cpu':
+    if info['backend'] in ('cuda', 'rocm'):
         torch.cuda.set_device(device)
         info['gpu_name'] = torch.cuda.get_device_name(device)
+    elif info['backend'] == 'mps':
+        info['gpu_name'] = 'Metal (MPS)'
     if check_cpu or info['backend'] != 'cpu':
         try:
             info['check_losses'] = device_smoke_test(device)
@@ -982,7 +1019,7 @@ def main():
     w.add_argument('--token', required=True, help='bearer token, or @FILE to read it from a file')
     w.add_argument('--name', default='worker-' + secrets.token_hex(3),
                    help='public pseudonym (default: random worker label, never the hostname)')
-    w.add_argument('--device', default='cpu', help='cpu (default), auto, cuda[:N], or rocm[:N] for AMD; '
+    w.add_argument('--device', default='cpu', help='cpu (default), auto, cuda[:N], rocm[:N] for AMD, or mps for Mac; '
                    'explicit GPU requests fail if unavailable, rather than falling back to CPU')
     w.add_argument('--threads', type=int, default=2)
     w.add_argument('--share-hardware', action='store_true', help='opt in to public self-reported GPU model/memory, '
@@ -992,7 +1029,7 @@ def main():
     w.add_argument('--hours', type=float, default=0, help='stop after this many hours (0 = run forever)')
     w.add_argument('--once', type=int, default=0, help='stop after this many leases (tests)')
     d = sp.add_parser('check-device', help='offline tiny training and serialization test; no token or network')
-    d.add_argument('--device', default='cpu', help='cpu, auto, cuda[:N], or rocm[:N]')
+    d.add_argument('--device', default='cpu', help='cpu, auto, cuda[:N], rocm[:N], or mps')
     d.add_argument('--threads', type=int, default=2)
     for name in ('sample', 'eval'):
         s = sp.add_parser(name)
@@ -1013,4 +1050,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 

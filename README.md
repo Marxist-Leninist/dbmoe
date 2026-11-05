@@ -268,7 +268,7 @@ Increase upload limits only as needed for the block size. Retained snapshots are
 
 ## Local coordinator
 
-The worker needs PyTorch. Streaming coordinator data additionally needs `huggingface_hub` and `pyarrow`, or `datasets` for dataset-library streaming. You can instead use a local text file you have permission to train on.
+The worker needs PyTorch. The coordinator also requires NumPy for immutable snapshot fingerprints. After selecting the appropriate PyTorch build for your hardware, install the declared dependencies with `python -m pip install -r requirements.txt` before starting a coordinator. Streaming coordinator data additionally needs `huggingface_hub` and `pyarrow`, or `datasets` for dataset-library streaming. You can instead use a local text file you have permission to train on.
 
 ```sh
 python dbmoe.py coord --dir run --host 127.0.0.1 \

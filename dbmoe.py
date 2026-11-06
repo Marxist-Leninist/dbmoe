@@ -64,7 +64,7 @@ byte's logits.  A slow or vanished worker's hop is rerouted; if no worker has a 
 and the reply says so.  Results are spot-checked against the snapshot and workers that lie stop being used.  The reply is
 a stream of JSON lines naming the (anonymous) worker behind every hop.
 """
-import argparse, array, base64, collections, ctypes, hashlib, hmac, http.client as httpc, io, ipaddress, json, math, os, platform, random, re, secrets, select, socket, struct, sys, threading, time, urllib.error, urllib.parse, urllib.request
+import argparse, array, base64, collections, ctypes, hashlib, hmac, http.client as httpc, io, ipaddress, json, math, os, platform, random, re, secrets, select, socket, struct, sys, threading, time, urllib.error, urllib.parse, urllib.request, zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
@@ -449,6 +449,25 @@ def to_bytes(obj):
 
 
 def from_bytes(b):
+    return torch.load(io.BytesIO(b), map_location='cpu', weights_only=True)
+
+
+def load_update_pickle(b, max_bytes, max_entries=4096):
+    """from_bytes for the UNTRUSTED POST /update pickle path.  torch.save writes a ZIP whose entries are STORED
+    (uncompressed), so a genuine update's uncompressed size ~ its wire size.  A hostile worker could instead send a
+    DEFLATE-compressed ZIP that inflates ~1000x and exhausts the coordinator's RAM before the gate ever runs, so
+    reject by the archive's declared uncompressed size (and entry count) before torch.load allocates anything.  The
+    wire body is already <= max_bytes, and a STORED update's uncompressed total is <= that, so legitimate updates
+    always pass.  A non-ZIP body can't inflate past its own length, so it skips the check.  The safetensors update
+    path (st_loads) is bounded separately."""
+    if b[:4] == b'PK\x03\x04':
+        with zipfile.ZipFile(io.BytesIO(b)) as zf:
+            infos = zf.infolist()
+            if len(infos) > max_entries:
+                raise ValueError(f'update archive has too many entries ({len(infos)} > {max_entries})')
+            total = sum(i.file_size for i in infos)
+            if total > max_bytes:
+                raise ValueError(f'update inflates to {total} bytes, over the {max_bytes}-byte cap')
     return torch.load(io.BytesIO(b), map_location='cpu', weights_only=True)
 
 
@@ -2353,7 +2372,7 @@ def serve(a):
                         return self._reject(400, 'incomplete body')
                     body.extend(chunk)
                 ctype = (self.headers.get('Content-Type') or '').split(';')[0].strip().lower()
-                up = update_from_safetensors(body) if ctype == ST_UPDATE_TYPE else from_bytes(body)
+                up = update_from_safetensors(body) if ctype == ST_UPDATE_TYPE else load_update_pickle(body, a.max_upload_mb << 20)
                 if not isinstance(up, dict):
                     return self._reject(400, 'bad payload')
                 name = up.get('name', 'worker')

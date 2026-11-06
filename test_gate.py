@@ -305,6 +305,8 @@ class CoordinatorTests(unittest.TestCase):
             L = C._lease(f'trusted/w{i}', 2, 1, 's', owner='trusted')
             got[L['block']] += 1
             C.leases.pop(L['lease'])
+            # What balances the blocks is accepted work, so count this job as accepted.
+            C.meta.setdefault('training_balance', dict(start_updates=0, accepted_tokens=[0] * CFG['blocks'], recent=[]))['recent'].append([L['block'], 2 * CFG['ctx']])
         self.assertGreater(got[1], got[0] * 3)
         self.assertGreater(got[0], 0)                   # nothing starves
 

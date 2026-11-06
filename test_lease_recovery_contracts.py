@@ -38,8 +38,9 @@ def load_actual_source():
                 fields.append(segment(node))
     if not fields:
         raise ValueError('actual Coordinator initializer has no pending reservation fields')
-    return dict(revision=hashlib.sha256(raw).hexdigest(), path=str(path.resolve()),
-                lease_source=''.join(segment(methods[name]) for name in ('expire', 'lease', '_lease')),
+    choose = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == 'choose_training_block')
+    return dict(revision=hashlib.sha256(raw).hexdigest(), path=str(path.resolve()), choose_source=segment(choose),
+                lease_source=''.join(segment(methods[name]) for name in ('expire', 'lease', '_lease', 'training_balance')),
                 check_source=segment(methods['_check']), init_fields=''.join(fields))
 
 
@@ -94,7 +95,7 @@ class EmptyState:
 ns = dict(time=time, math=math, random=random, secrets=secrets, threading=threading,
           torch=SimpleNamespace(randperm=lambda n: list(range(n))),
           VERSION='bookkeeping-test', LeaseCapacityError=LeaseCapacityError)
-actual_source = 'class Coordinator:\n' + SNAPSHOT['lease_source'] + SNAPSHOT['check_source']
+actual_source = SNAPSHOT['choose_source'] + 'class Coordinator:\n' + SNAPSHOT['lease_source'] + SNAPSHOT['check_source']
 exec(compile(actual_source, SNAPSHOT['path'] + '@' + SNAPSHOT['revision'], 'exec'), ns)
 Coordinator = ns['Coordinator']
 
@@ -114,7 +115,7 @@ def fixture():
     C.min_steps, C.steps, C.max_steps, C.batch, C.max_batch = 10, 10, 400, 2, 64
     C.lr, C.ttl, C.check_windows = 0.001, 1800, 6
     C.leases = {}
-    C.meta = dict(block_updates=[0, 0], workers={})
+    C.meta = dict(updates=0, block_updates=[0, 0], workers={})
     C.model = SimpleNamespace(cfg=dict(blocks=2, ctx=8), sigmas=[0.01, 0.1, 1.0],
                               shared=EmptyState(), blocks=[EmptyState(), EmptyState()])
     C.data = Source()

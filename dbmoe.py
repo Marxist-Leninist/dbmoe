@@ -44,7 +44,8 @@ tensors and plain values and are always loaded with weights_only=True (no pickle
 checked (keys, shapes, finite, |delta| <= 3.5*lr*steps, the Adam bound) before it is merged.  Workers without PyTorch
 (worker-rs/, the Rust worker) opt into safetensors instead: GET lease?fmt=safetensors, and POST update with
 Content-Type application/vnd.dbmoe.update+safetensors; the same fields and the same checks.  Merging is
-asynchronous delta averaging: block += d_block / (leases that overlapped on that block).  Shared parameters define the
+asynchronous delta averaging: block += d_block * n / (the work n of every job that overlapped on that block), so
+overlapping jobs share a step in proportion to their work and equal jobs split it evenly.  Shared parameters define the
 target every block denoises toward, so they move in rounds: deltas are banked per block and applied together every 12
 updates, weighted by what each block still has to learn, so all blocks see one stable embedding between rounds.  Workers
 keep Adam's per-parameter scale between leases of a block but not its momentum, which points where old weights wanted to go.
@@ -1671,23 +1672,26 @@ class Coordinator:
             self.expire()
             for k in [k for k, v in self.leases.items() if v['worker'] == worker and v.get('owner', v['worker'].split('/', 1)[0]) == owner]:
                 self.log(ev='lease_abandoned', lease=k, block=self.leases.pop(k)['block'], worker=worker)
-            B, bu = self.model.cfg['blocks'], self.meta['block_updates']
-            active = [0] * B
-            for v in self.leases.values():
-                active[v['block']] += 1
+            bu = self.meta['block_updates']
             w = self.meta['workers'].get(worker) or {}
             balance = self.training_balance()
             b = choose_training_block(self.block_weights(), balance['recent_accepted_tokens'],
                                       balance['inflight_tokens'], steps * batch * self.model.cfg['ctx'],
                                       w.get('last_block'))
+            # same: the work overlapping this job on its block, itself included, in units of this job.  It merges at 1/same, so
+            # jobs share a step in proportion to their work: equal jobs split it evenly, and a small job doesn't dilute a big one.
+            n, overlap = steps * batch, 0
             for v in self.leases.values():
                 v['all'] += 1
-                v['same'] += v['block'] == b
+                if v['block'] == b:
+                    vn = v['steps'] * v['batch']
+                    v['same'] += n / vn
+                    overlap += vn
             wall = w.get('wall_s')
             ttl = self.ttl if not wall else max(300.0, min(self.ttl, 8 * wall * steps / max(1, w.get('steps', steps)) + 120))
             lid = secrets.token_hex(8)
             self.leases[lid] = dict(block=b, worker=worker, owner=owner, client=client, session=session, t0=time.time(), ttl=ttl, steps=steps, batch=batch,
-                                    same=active[b] + 1, all=len(self.leases) + 1)
+                                    same=(n + overlap) / n, all=len(self.leases) + 1)
             self.leases[lid]['check'] = data[torch.randperm(data.size(0))[:self.check_windows]].clone()
             payload = dict(version=VERSION, lease=lid, block=b, block_version=bu[b], cfg=self.model.cfg, sigmas=self.model.sigmas,
                            shared={k: v.clone() for k, v in self.model.shared.state_dict().items()},
@@ -1735,13 +1739,14 @@ class Coordinator:
             return [1.0] * B
         return [max(0.25, c * B / sum(ev)) for c in ev]
 
-    def _bank_shared(self, b, d):
+    def _bank_shared(self, b, d, work=1):
         """Shared parameters define the target every block denoises toward, so they must not drift under one block's
         gradients between other blocks' leases.  Deltas wait here and go in together as one round."""
-        bank = self.shared_bank.setdefault(b, dict(n=0, sum={k: torch.zeros_like(v) for k, v in d.items()}))
+        bank = self.shared_bank.setdefault(b, dict(n=0, work=0, sum={k: torch.zeros_like(v) for k, v in d.items()}))
         bank['n'] += 1
+        bank['work'] += work
         for k, v in d.items():
-            bank['sum'][k].add_(v)
+            bank['sum'][k].add_(v, alpha=work)
         if sum(v['n'] for v in self.shared_bank.values()) >= self.shared_round and not self.round_busy:
             self.round_busy = True
             threading.Thread(target=self._commit_round, args=(self.shared_bank,), daemon=True).start()
@@ -1759,7 +1764,7 @@ class Coordinator:
             cfg, B = self.model.cfg, self.model.cfg['blocks']
             with self.lock:
                 wt = self.block_weights()
-                delta = {k: sum(v['sum'][k] * (wt[i] / sum(wt) / v['n']) for i, v in bank.items()) for k in self.model.shared.state_dict()}
+                delta = {k: sum(v['sum'][k] * (wt[i] / sum(wt) / v.get('work', v['n'])) for i, v in bank.items()) for k in self.model.shared.state_dict()}
                 sh = {k: v.clone() for k, v in self.model.shared.state_dict().items()}
                 blocks = {i: {k: v.clone() for k, v in self.model.blocks[i].state_dict().items()} for i in {B - 1, random.randrange(B)}}
                 tol, slack = (0.0, 0.0) if self.gate_strict else (self.gate_tol, 0.003)
@@ -1907,7 +1912,7 @@ class Coordinator:
             with torch.no_grad():
                 for k, p in self.model.blocks[b].state_dict().items():
                     p.add_(up['d_block'][k].to(p.dtype), alpha=1.0 / (checked['same'] if checked else L['same']))    # the weight it was tested at
-                self._bank_shared(b, up['d_shared'])
+                self._bank_shared(b, up['d_shared'], L['steps'] * L['batch'])
             m = self.meta
             toks = int(L['steps'] * L['batch'] * self.model.cfg['ctx'])
             m['updates'] += 1
@@ -1936,7 +1941,7 @@ class Coordinator:
             hardware = normalize_hardware(up.get('hardware'))
             if hardware:
                 w['hardware'] = hardware
-            self.log(ev='update', lease=up['lease'], block=b, worker=worker, same=L['same'], all=L['all'],
+            self.log(ev='update', lease=up['lease'], block=b, worker=worker, same=round(L['same'], 3), all=L['all'],
                      ce_first=losses[0] if losses else None, ce_last=lo, tokens=toks, seconds=round(sec, 2),
                      tok_s=round(toks / max(sec, 1e-6), 1))
             n = m['updates']
@@ -2604,6 +2609,8 @@ def prepare_worker_device(requested, check_cpu=False, xpu_memory_fraction=None):
     if info['backend'] in ('cuda', 'rocm'):
         torch.cuda.set_device(device)
         info['gpu_name'] = torch.cuda.get_device_name(device)
+        if info['backend'] == 'cuda':
+            torch.backends.cuda.matmul.allow_tf32 = True    # about 10% faster on an RTX 3090, loss unchanged to three decimals; ignored before Ampere
     elif info['backend'] == 'xpu':
         torch.xpu.set_device(device)
         info['gpu_name'] = torch.xpu.get_device_name(device)

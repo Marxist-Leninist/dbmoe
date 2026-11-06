@@ -2337,6 +2337,9 @@ def serve(a):
                     return self._reject(404, 'not found')
                 if not C.has_lease(who):
                     return self._reject(409, 'no active lease')
+                ctype = (self.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+                if ctype != ST_UPDATE_TYPE:
+                    return self._reject(415, 'updates require safetensors; upgrade the worker')
                 lengths = self.headers.get_all('Content-Length', [])
                 if self.headers.get('Transfer-Encoding') or len(lengths) != 1:
                     return self._reject(400, 'unsupported body framing')
@@ -2360,8 +2363,7 @@ def serve(a):
                     if not chunk:
                         return self._reject(400, 'incomplete body')
                     body.extend(chunk)
-                ctype = (self.headers.get('Content-Type') or '').split(';')[0].strip().lower()
-                up = update_from_safetensors(body) if ctype == ST_UPDATE_TYPE else from_bytes(body)
+                up = update_from_safetensors(body)
                 if not isinstance(up, dict):
                     return self._reject(400, 'bad payload')
                 name = up.get('name', 'worker')

@@ -1095,6 +1095,39 @@ class _Slot:
         self.block, self.conn, self.event, self.job = block, conn, threading.Event(), None
 
 
+class AllocatorMaintenance:
+    """Return unused native heap pages, at most once a minute; never touch live tensors."""
+    def __init__(self, interval=60.0, clock=time.monotonic):
+        self.interval, self.clock = interval, clock
+        self._lock = threading.Lock()
+        self._last = float('-inf')
+        self._trim = None
+        if sys.platform.startswith('linux'):
+            try:
+                trim = ctypes.CDLL(None).malloc_trim
+                trim.argtypes = [ctypes.c_size_t]
+                trim.restype = ctypes.c_int
+                self._trim = trim
+            except (AttributeError, OSError):
+                pass
+
+    def maybe_trim(self):
+        if self._trim is None or not self._lock.acquire(blocking=False):
+            return False
+        try:
+            now = self.clock()
+            if now - self._last < self.interval:
+                return False
+            self._last = now
+            self._trim(0)
+            return True
+        except Exception:
+            self._trim = None
+            return False
+        finally:
+            self._lock.release()
+
+
 class NetInfer:
     """Network-distributed inference: the chain of blocks runs on the workers and the coordinator only routes.
     Workers hold one block of a frozen snapshot and long-poll for hops.  Snapshots roll every `refresh` seconds; the
@@ -1114,6 +1147,7 @@ class NetInfer:
         self.stats = dict(generations=0, bytes=0, seconds=0.0, hops_network=0, hops_coordinator=0, retries=0, audits=0, audit_failures=0)
         self.recent = collections.deque(maxlen=64)
         self.auto_choices = {}                 # (snapshot, sampler) -> measured paired route choice
+        self.memory_maintenance = AllocatorMaintenance()
         self.snapshot()
         threading.Thread(target=self._housekeeping, daemon=True).start()
 
@@ -1159,6 +1193,8 @@ class NetInfer:
                     t = time.time()
                     for k in [k for k, q in self.peers.items() if t - q['seen'] > 120 and k not in self.idle]:
                         del self.peers[k]
+                # Outside model/network locks; glibc only releases unused heap pages.
+                self.memory_maintenance.maybe_trim()
             except Exception as e:
                 print(f'[net] housekeeping: {e!r}', flush=True)
 

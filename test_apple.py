@@ -110,10 +110,10 @@ class AppleDeviceTests(unittest.TestCase):
         update = dbmoe.train_lease(lease, 'cpu')  # transport only, not simulated Metal execution
         for opt_in in (False, True):
             sent = []
-            def http(method, url, token, body=None):
+            def http(method, url, token, body=None, **kwargs):
                 if method == 'GET':
                     return dbmoe.to_bytes(lease)
-                sent.append(dbmoe.from_bytes(body))
+                sent.append(dbmoe.update_from_safetensors(body))
                 return b'{"ok":true}'
             args = argparse.Namespace(threads=1, device='mps', url='https://example.invalid', token='test-only',
                                       name='test', hours=0, steps=2, batch=1, once=1, no_share_hardware=not opt_in)

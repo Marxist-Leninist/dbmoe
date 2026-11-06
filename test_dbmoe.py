@@ -156,7 +156,7 @@ class TrainingTests(unittest.TestCase):
     def test_worker_one_cpu_lease_round_trip(self):
         L = tiny_lease()
         calls = []
-        def http(method, url, token, body=None):
+        def http(method, url, token, body=None, **kwargs):
             calls.append((method, url, token, body))
             return dbmoe.to_bytes(L) if method == 'GET' else json.dumps(dict(ok=True)).encode()
         a = argparse.Namespace(threads=1, device='cpu', url='https://example.invalid', token='test-only',
@@ -164,15 +164,15 @@ class TrainingTests(unittest.TestCase):
         with mock.patch.object(dbmoe, 'http', side_effect=http), contextlib.redirect_stdout(io.StringIO()):
             dbmoe.worker(a)
         self.assertEqual([c[0] for c in calls], ['GET', 'POST'])
-        self.assertEqual(dbmoe.from_bytes(calls[1][3])['device'], 'cpu')
+        self.assertEqual(dbmoe.update_from_safetensors(calls[1][3])['device'], 'cpu')
 
     def test_amd_payload_uses_rocm_label_not_pytorch_cuda_label(self):
         L = tiny_lease()
         up = dbmoe.train_lease(L, 'cpu')
         sent = []
-        def http(method, url, token, body=None):
+        def http(method, url, token, body=None, **kwargs):
             if body:
-                sent.append(dbmoe.from_bytes(body))
+                sent.append(dbmoe.update_from_safetensors(body))
             return dbmoe.to_bytes(L) if method == 'GET' else b'{"ok":true}'
         a = argparse.Namespace(threads=1, device='rocm', url='https://example.invalid', token='test-only',
                                name='test', hours=0, steps=2, batch=1, once=1)
@@ -256,9 +256,9 @@ class HardwarePrivacyTests(unittest.TestCase):
         up = dbmoe.train_lease(L, 'cpu')
         for opted_in in (False, True):
             calls = []
-            def http(method, url, token, body=None):
+            def http(method, url, token, body=None, **kwargs):
                 if body:
-                    calls.append(dbmoe.from_bytes(body))
+                    calls.append(dbmoe.update_from_safetensors(body))
                 return dbmoe.to_bytes(L) if method == 'GET' else b'{"ok":true}'
             a = argparse.Namespace(threads=1, device='cpu', url='https://example.invalid', token='test-only',
                                    name='test', hours=0, steps=2, batch=1, once=1, no_share_hardware=not opted_in)

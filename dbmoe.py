@@ -1632,6 +1632,11 @@ class Coordinator:
         self.gate_drift, self.check_windows, self.min_steps = {}, 6, a.min_steps
         torch.set_num_threads(a.eval_threads)
         self.upload_slots = threading.BoundedSemaphore(32)
+        self.update_formats, self.pickle_last = collections.Counter(), None   # wire format of each parsed /update body
+        self.format_lock = threading.Lock()
+        self.pickle_policy = getattr(a, 'pickle_updates', 'guarded')
+        if self.pickle_policy not in ('guarded', 'reject'):
+            raise SystemExit(f'--pickle-updates / DBMOE_PICKLE_UPDATES must be guarded or reject, not {self.pickle_policy!r}')
         self.gate_slots = threading.BoundedSemaphore(2)     # tests run two at a time; uploads wait their turn
         self.tok_path, self.tok_mtime, self.tokens = a.tokens, None, {}
         self.steps, self.batch, self.lr, self.ttl = a.steps, a.batch, a.lr, a.lease_ttl
@@ -2208,6 +2213,24 @@ class Coordinator:
         result['open_join'] = dict(open=True, **self.enrol.stats()) if self.enrol else dict(open=False)
         return result
 
+    def note_update_format(self, safetensors):
+        """Count the wire format of each /update body that parsed, so --pickle-updates reject can wait until no worker
+        still sends torch.save (pickle) updates."""
+        with self.format_lock:
+            self.update_formats['safetensors' if safetensors else 'pickle'] += 1
+            if not safetensors:
+                self.pickle_last = time.time()
+
+    def update_format_status(self):
+        lock = getattr(self, 'format_lock', None)
+        if lock is None:                              # never let format telemetry break /status
+            return dict(safetensors=0, pickle=0, pickle_last_age_s=None,
+                        pickle_policy=getattr(self, 'pickle_policy', 'guarded'))
+        with lock:
+            return dict(safetensors=self.update_formats['safetensors'], pickle=self.update_formats['pickle'],
+                        pickle_last_age_s=None if self.pickle_last is None else round(time.time() - self.pickle_last),
+                        pickle_policy=self.pickle_policy)
+
     def status(self):
         with self.lock:
             self.expire()
@@ -2216,6 +2239,7 @@ class Coordinator:
                         params=sum(p.numel() for p in self.model.parameters()), updates=m['updates'], tokens=m['tokens'],
                         rejected=m['rejected'], block_updates=m['block_updates'], block_ce=m['block_ce'],
                         training_balance=self.training_balance(),
+                        update_formats=self.update_format_status(),
                         active_leases=[dict(block=v['block'], worker=v['worker'], age_s=round(time.time() - v['t0']))
                                        for v in self.leases.values()],
                         workers={k: {f: v for f, v in w.items() if f not in ('host', 'ip')} for k, w in m['workers'].items()}, last_eval=(m['evals'][-1] if m['evals'] else None),
@@ -2467,6 +2491,10 @@ def serve(a):
                     return self._reject(404, 'not found')
                 if not C.has_lease(who):
                     return self._reject(409, 'no active lease')
+                ctype = (self.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+                if ctype != ST_UPDATE_TYPE and C.pickle_policy == 'reject':     # decided before any body byte is read
+                    return self._reject(415, 'updates require safetensors; upgrade the worker (re-run the join script, '
+                                             'or fetch /code)')
                 lengths = self.headers.get_all('Content-Length', [])
                 if self.headers.get('Transfer-Encoding') or len(lengths) != 1:
                     return self._reject(400, 'unsupported body framing')
@@ -2490,10 +2518,10 @@ def serve(a):
                     if not chunk:
                         return self._reject(400, 'incomplete body')
                     body.extend(chunk)
-                ctype = (self.headers.get('Content-Type') or '').split(';')[0].strip().lower()
                 up = update_from_safetensors(body) if ctype == ST_UPDATE_TYPE else load_update_pickle(body, a.max_upload_mb << 20)
                 if not isinstance(up, dict):
                     return self._reject(400, 'bad payload')
+                C.note_update_format(ctype == ST_UPDATE_TYPE)
                 name = up.get('name', 'worker')
                 if not isinstance(name, str):
                     return self._reject(400, 'invalid worker name')
@@ -3239,6 +3267,11 @@ def main():
     c.add_argument('--eval-threads', type=int, default=4)
     c.add_argument('--heldout', type=int, default=32)
     c.add_argument('--max-upload-mb', type=int, default=256)
+    c.add_argument('--pickle-updates', choices=('guarded', 'reject'),
+                   default=os.environ.get('DBMOE_PICKLE_UPDATES', 'guarded'),
+                   help='torch.save (pickle) /update bodies from older Python workers: "guarded" accepts them only '
+                        'through the bounded ZIP gate (load_update_pickle), "reject" refuses them with 415 before '
+                        'reading the body. Switch to reject once /status update_formats shows no recent pickle uploads.')
     c.add_argument('--seed', type=int, default=0)
     c.add_argument('--no-open-join', dest='open_join', action='store_false', help='only tokens from --tokens may take part')
     c.add_argument('--join-bits', type=int, default=18, help='proof-of-work difficulty for a new credential')

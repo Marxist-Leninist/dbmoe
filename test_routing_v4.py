@@ -98,11 +98,12 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(len(workers.jobs), 72)
     def test_auto_selects_measured_distributed_and_caches(self):
         net = fixture()
-        local = net._local
-        def slow_local(job, model):
-            time.sleep(.05)
-            return local(job, model)
-        with Workers(net), mock.patch.object(net, '_local', side_effect=slow_local):
+        real = db.run_segment
+        def slow_single(*a, **kw):                      # only the single route passes prepared=
+            if kw.get('prepared') is not None:
+                time.sleep(.05)
+            return real(*a, **kw)
+        with Workers(net), mock.patch.object(db, 'run_segment', side_effect=slow_single):
             first = list(net.generate('A', 1, seed=19, sampler='top', route='auto'))
             second = list(net.generate('A', 1, seed=19, sampler='top', route='auto'))
         self.assertEqual(first[0]['requested_route'], 'auto')
@@ -187,7 +188,7 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(lg.numel(), 256)
     def test_failure_after_byte_releases_pin(self):
         net = fixture(); g = net.generate('A', 3, route='single'); next(g); next(g)
-        with mock.patch.object(net, 'hop', side_effect=RuntimeError('test failure')):
+        with mock.patch.object(db, 'run_segment', side_effect=RuntimeError('test failure')):
             with self.assertRaises(RuntimeError): next(g)
         self.assertFalse(net.active_snaps)
     def test_epoch_hash_and_sigmas(self):
@@ -261,7 +262,7 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(out[0]['route'], 'single')
         self.assertEqual(out[-1]['route'], 'single')
     def test_auto_http_total_failure_closes_cleanly(self):
-        with mock.patch.object(self.net, '_local', side_effect=RuntimeError('test')):
+        with mock.patch.object(self.net, '_local', side_effect=RuntimeError('test')), mock.patch.object(db, 'run_segment', side_effect=RuntimeError('test')):
             out = self.run_request(dict(route='auto', sampler='top'))
         self.assertEqual(self.status, [409])
         self.assertEqual(out, [])
@@ -276,7 +277,7 @@ class HTTPTests(unittest.TestCase):
         self.h.wfile = mock.Mock(); self.h.wfile.write.side_effect = BrokenPipeError()
         self.h._net_sample(dict(route='single', n='1')); self.assertFalse(self.net.gen_lock.locked()); self.assertFalse(self.net.active_snaps)
     def test_midstream_error_no_done(self):
-        with mock.patch.object(self.net, 'hop', side_effect=RuntimeError('test')):
+        with mock.patch.object(db, 'run_segment', side_effect=RuntimeError('test')):
             out = self.run_request(dict(route='single'))
         self.assertEqual(self.status, [200]); self.assertEqual([e['t'] for e in out], ['start', 'error'])
 

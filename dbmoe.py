@@ -218,13 +218,15 @@ class Shared(nn.Module):
         return self.ln(D) @ self.table().t() * (self.scale * self.k)
 
 
-def dblock_loss(shared, block, lo, hi, x, aux_w, sigma=None):
+def dblock_loss(shared, block, lo, hi, x, aux_w, sigma=None, generator=None):
     """x: [batch, T+1] byte ids.  DiffusionBlocks loss for one block at sigma ~ logU[lo, hi] (or a given sigma)."""
     ids, tgt = x[:, :-1], x[:, 1:]
     if sigma is None:
         sigma = torch.exp(torch.empty(x.size(0), device=x.device).uniform_(math.log(lo), math.log(hi)))
     e = shared.embed(tgt)
-    z = e + sigma[:, None, None] * torch.randn_like(e)
+    noise = (torch.randn_like(e) if generator is None else
+             torch.randn(e.shape, dtype=e.dtype, device=e.device, generator=generator))
+    z = e + sigma[:, None, None] * noise
     D, aux, fracs = block(shared.context(ids), z, sigma)
     ce = F.cross_entropy(shared.logits(D).flatten(0, 1).float(), tgt.flatten(), reduction='none').view_as(tgt)
     w = edm_w(sigma)[:, None]
@@ -263,17 +265,25 @@ def sample_sigma(cfg, lo, hi, n, device='cpu'):
 
 
 @torch.no_grad()
-def run_segment(shared, block, raw_ids, ek_seed, z, grid, final, exit_conf=0.0):
+def prepare_segment(shared, raw_ids, ek_seed):
+    """Per-byte immutable context, reused by all local blocks of one frozen snapshot."""
+    ids = torch.tensor([list(raw_ids)], dtype=torch.long)
+    tab = shared.table()
+    ctx = F.embedding(ids, tab) + shared.pos[:ids.size(1)]
+    known = F.embedding(ids[:, 1:], tab)
+    ek = torch.randn(known.shape, generator=torch.Generator().manual_seed(ek_seed))
+    return ctx, tab, known, ek
+
+
+@torch.no_grad()
+def run_segment(shared, block, raw_ids, ek_seed, z, grid, final, exit_conf=0.0, prepared=None):
     """One block's part of one byte: Euler steps of the probability-flow ODE over its noise range.  z: [1, 1, d] at
     grid[0].  Returns z at grid[-1], and the byte's logits [vocab] if this is the last block or the posterior has collapsed."""
-    ids = torch.tensor([list(raw_ids)], dtype=torch.long)
-    ctx, tab = shared.context(ids), shared.table()
-    known = shared.embed(ids[:, 1:])                    # the next byte is known for positions 0..T-2
-    ek = torch.randn(known.shape, generator=torch.Generator().manual_seed(ek_seed))
+    ctx, tab, known, ek = prepare_segment(shared, raw_ids, ek_seed) if prepared is None else prepared
     lg = None
     for a, b in zip(grid[:-1], grid[1:]):
         D, _, _ = block(ctx, torch.cat([known + a * ek, z], 1), torch.full((1,), float(a)))
-        lg = shared.logits(D[:, -1:])
+        lg = shared.ln(D[:, -1:]) @ tab.t() * (shared.scale * shared.k)
         p = lg.softmax(-1)
         if exit_conf and float(p.max()) >= exit_conf:
             return z, lg[0, -1]
@@ -322,12 +332,13 @@ def evaluate(model, x):
     sigma_max (the next-byte prediction from context alone: a proper conditional distribution, reported as bits/byte)."""
     x = x.long()
     sig, B = model.sigmas, model.cfg['blocks']
-    torch.manual_seed(0)
+    # Private RNG: concurrent gate/model construction must not perturb evaluation noise.
+    gen = torch.Generator(device=x.device).manual_seed(0)
     per = []
     for i in range(B):
         s = torch.full((x.size(0),), math.sqrt(sig[i] * sig[i + 1]))
-        per.append(round(float(dblock_loss(model.shared, model.blocks[i], 0, 0, x, 0, sigma=s)[1]), 4))
-    _, ce, fr = dblock_loss(model.shared, model.blocks[-1], 0, 0, x, 0, sigma=torch.full((x.size(0),), sig[-1]))
+        per.append(round(float(dblock_loss(model.shared, model.blocks[i], 0, 0, x, 0, sigma=s, generator=gen)[1]), 4))
+    _, ce, fr = dblock_loss(model.shared, model.blocks[-1], 0, 0, x, 0, sigma=torch.full((x.size(0),), sig[-1]), generator=gen)
     return dict(ar_ce=round(float(ce), 4), ar_bits_per_byte=round(float(ce) / LN2, 4), per_block_ce=per,
                 top_block_expert_frac=[[round(float(v), 3) for v in f] for f in fr])
 
@@ -576,6 +587,23 @@ def now():
 
 
 # --------------------------------------------------------------------------------------------------------------- data
+def choose_training_block(weights, accepted, inflight, job_tokens, last=None):
+    """Weighted byte deficit; callers reserve the returned block under their lease lock.
+
+    Completion history is bounded; live reservations prevent concurrent dispatches
+    oversubscribing the same deficit. Stickiness can only spend 5% of one job.
+    This balances exposure to the existing noise curriculum, not raw update counts.
+    """
+    total_weight = sum(weights)
+    total = sum(accepted) + sum(inflight) + job_tokens
+    deficit = [total * w / total_weight - accepted[i] - inflight[i]
+               for i, w in enumerate(weights)]
+    best = max(range(len(weights)), key=lambda i: (deficit[i], -i))
+    if last in range(len(weights)) and deficit[last] >= deficit[best] - job_tokens * 0.05:
+        return last
+    return best
+
+
 class LeaseCapacityError(RuntimeError):
     pass
 
@@ -1208,7 +1236,7 @@ class NetInfer:
                 return None, None, None
             model = s['model']
         zc, lc = self._local(j, model)
-        if (lg is None) != (lc is None):                # right at the exit threshold, rounding may decide differently: look again either side of it
+        if (lg is None) != (lc is None) and 0.0 < j.get('exit_conf', 0.0) < 1.0:  # only configured confidence exits admit threshold tolerance
             zc, lc = self._local(j, model, j.get('exit_conf', 0.0) + (-0.01 if lg is not None else 0.01))
         ok = (lg is None) == (lc is None) and float((zl - zc).abs().max()) <= 0.02 * max(1.0, float(zc.abs().max()))
         if ok and lc is not None:
@@ -1255,6 +1283,9 @@ class NetInfer:
             if got:
                 try:
                     zl, lg = self._decode(P['result'], job['final'], self.snaps[job['snap']]['model'].cfg)
+                    if not job['final'] and not job.get('exit_conf', 0.0) and lg is not None:
+                        zl = None
+                        raise ValueError('unexpected early-exit logits in full chain')
                 except Exception as e:
                     print(f'[net] bad hop result: {e!r}', flush=True)
             if zl is None:
@@ -1326,12 +1357,13 @@ class NetInfer:
             self.auto_choices[key] = dict(result)
         return result
 
-    def generate(self, prompt, n, temp=0.0, top_k=40, seed=0, sampler='chain', route='network', snapshot_id=None, _calibration=False):
+    def generate(self, prompt, n, temp=0.0, top_k=40, seed=0, sampler='chain', route='network', snapshot_id=None, _calibration=False, budget_s=None):
         """Yield JSON-ready events using one pinned snapshot and the requested sampler."""
         if route not in ('auto', 'single', 'distributed', 'network'):
             raise ValueError('route must be auto, single, distributed or network')
         if sampler not in ('chain', 'top'):
             raise ValueError('sampler must be chain or top')
+        deadline = time.monotonic() + budget_s if budget_s is not None else None
         requested_route = route
         gen = torch.Generator().manual_seed(seed)
         ids = encode(prompt) or [10]
@@ -1357,7 +1389,9 @@ class NetInfer:
                     raise RuntimeError('requested distributed snapshot lacks block coverage')
             self.active_snaps[sid] += 1
         B, spb = cfg['blocks'], self.spb
-        sampler_config = dict(temp=temp, top_k=top_k, steps_per_block=spb, ctx_len=self.ctx_len, exit_conf=EXIT_CONF)
+        # The UI promises every block for chain; confidence shortcuts are not a full chain.
+        exit_conf = 0.0
+        sampler_config = dict(temp=temp, top_k=top_k, steps_per_block=spb, ctx_len=self.ctx_len, exit_conf=exit_conf)
         t_start, out, used, on_net, on_coord = time.time(), 0, set(), 0, 0
         try:
             yield dict(t='start', n=n, prompt_bytes=len(ids), coverage=self.coverage(sid), snapshot_id=sid,
@@ -1365,15 +1399,27 @@ class NetInfer:
                        calibration=_calibration, sampler=sampler, sampler_config=sampler_config, seed=seed,
                        snapshot_updates=s0['updates'], snapshot_age_s=round(time.time() - s0['t']))
             for k in range(n):
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 t0 = time.time()
-                raw = base64.b64encode(bytes(ids[-self.ctx_len:])).decode()
+                raw_ids = bytes(ids[-self.ctx_len:])
+                raw = base64.b64encode(raw_ids).decode()
                 ek_seed = int(torch.randint(2 ** 31 - 1, (1,), generator=gen))
                 zl = torch.randn(1, 1, cfg['d'], generator=gen) * sig[-1]
                 lg, hops = None, []
+                prepared = prepare_segment(s0['model'].shared, raw_ids, ek_seed) if route == 'single' else None
                 for i in ([B - 1] if sampler == 'top' else reversed(range(B))):
                     grid = [sig[-1], sig[-2]] if sampler == 'top' else block_grid(sig, i, spb)
-                    zl, lg, info = self.hop(dict(block=i, ids=raw, seed=ek_seed, z=encode_floats(zl), grid=grid,
-                                                 final=sampler == 'top' or i == 0, exit_conf=EXIT_CONF, snap=sid, route=route))
+                    if route == 'single':
+                        hop_start = time.time()
+                        zl, lg = run_segment(s0['model'].shared, s0['model'].blocks[i], raw_ids, ek_seed,
+                                             zl, grid, sampler == 'top' or i == 0, exit_conf, prepared=prepared)
+                        info = dict(block=i, via='coordinator', ms=round((time.time() - hop_start) * 1000))
+                        with self.cv:
+                            self.stats['hops_coordinator'] += 1
+                    else:
+                        zl, lg, info = self.hop(dict(block=i, ids=raw, seed=ek_seed, z=encode_floats(zl), grid=grid,
+                                                     final=sampler == 'top' or i == 0, exit_conf=exit_conf, snap=sid, route=route))
                     hops.append(info)
                     if info['via'] == 'coordinator':
                         on_coord += 1
@@ -1391,7 +1437,8 @@ class NetInfer:
             summary = dict(bytes=out, seconds=round(dt, 2), bytes_per_s=round(out / max(dt, 1e-6), 3), hops_network=on_net,
                            hops_coordinator=on_coord, hops_per_byte=round((on_net + on_coord) / max(out, 1), 2), workers=len(used), snapshot_id=sid, state_hash=s0['state_hash'], route=route,
                            requested_route=requested_route, auto_calibration=auto_info, calibration=_calibration,
-                           sampler=sampler, sampler_config=sampler_config, seed=seed, t=time.time())
+                           sampler=sampler, sampler_config=sampler_config, seed=seed, t=time.time(),
+                           stop_reason='time_budget' if deadline is not None and time.monotonic() >= deadline and out < n else 'length')
             with self.cv:
                 self.active_snaps[sid] -= 1
                 if not self.active_snaps[sid]:
@@ -1462,6 +1509,8 @@ class Coordinator:
             self.meta = dict(version=VERSION, created=now(), updates=0, tokens=0, data_docs=0, data_source=a.hf or a.text_file,
                              block_updates=[0] * self.model.cfg['blocks'], block_ce=[None] * self.model.cfg['blocks'],
                              workers={}, evals=[], rejected=0)
+        self.meta.setdefault('training_balance', dict(start_updates=self.meta['updates'],
+                            accepted_tokens=[0] * self.model.cfg['blocks'], recent=[]))
         self.meta.setdefault('worker_alias_salt', secrets.token_hex(32))
         self.meta.setdefault('gate', dict(passed=0, refused=0))
         self.leases = {}
@@ -1627,13 +1676,10 @@ class Coordinator:
             for v in self.leases.values():
                 active[v['block']] += 1
             w = self.meta['workers'].get(worker) or {}
-            wt = self.block_weights()
-            share = [wt[i] / (1 + active[i]) for i in range(B)]     # what each block has left to learn, spread over who is already on it
-            last = w.get('last_block')
-            if last in range(B) and random.random() < 0.8 and share[last] >= max(share) / 2:
-                b = last                     # sticky: the worker keeps its optimizer state for this block
-            else:
-                b = random.choices(range(B), weights=share)[0]
+            balance = self.training_balance()
+            b = choose_training_block(self.block_weights(), balance['recent_accepted_tokens'],
+                                      balance['inflight_tokens'], steps * batch * self.model.cfg['ctx'],
+                                      w.get('last_block'))
             for v in self.leases.values():
                 v['all'] += 1
                 v['same'] += v['block'] == b
@@ -1662,6 +1708,23 @@ class Coordinator:
             self.teacher = Teacher(tx)
         except Exception as e:
             print(f'[coord] teacher: {e!r}', flush=True)
+
+    def training_balance(self):
+        """Call under self.lock: expired/replaced/rejected leases are not reservations."""
+        B = self.model.cfg['blocks']
+        state = self.meta.get('training_balance') or dict(start_updates=self.meta['updates'],
+                    accepted_tokens=[0] * B, recent=[])
+        accepted, inflight = [0] * B, [0] * B
+        for b, tokens in state['recent']:
+            accepted[b] += tokens
+        for lease in self.leases.values():
+            inflight[lease['block']] += lease['steps'] * lease['batch'] * self.model.cfg['ctx']
+        weights = self.block_weights()
+        return dict(policy='weighted-byte-deficit-v1', history_limit_updates=1024,
+                    history_updates=len(state['recent']), start_updates=state['start_updates'],
+                    accepted_tokens=list(state['accepted_tokens']), recent_accepted_tokens=accepted,
+                    inflight_tokens=inflight, target_shares=[w / sum(weights) for w in weights],
+                    units='byte-target presentations; accepted counts begin at start_updates')
 
     def block_weights(self):
         """How much compute each block deserves.  Low-noise blocks can read the target off z, which is their job, so their
@@ -1850,6 +1913,12 @@ class Coordinator:
             m['updates'] += 1
             m['tokens'] += toks
             m['block_updates'][b] += 1
+            balance = m.setdefault('training_balance', dict(start_updates=m['updates'] - 1,
+                                  accepted_tokens=[0] * self.model.cfg['blocks'], recent=[]))
+            balance['accepted_tokens'][b] += toks
+            balance['recent'].append([b, toks])
+            del balance['recent'][:-1024]
+
             losses = [float(v) for v in (up.get('losses') or [])][:10000]
             lo = round(sum(losses[-5:]) / len(losses[-5:]), 4) if losses else None
             prev = m['block_ce'][b]
@@ -2008,6 +2077,7 @@ class Coordinator:
             return dict(version=VERSION, cfg=self.model.cfg, sigmas=[round(s, 4) for s in self.model.sigmas],
                         params=sum(p.numel() for p in self.model.parameters()), updates=m['updates'], tokens=m['tokens'],
                         rejected=m['rejected'], block_updates=m['block_updates'], block_ce=m['block_ce'],
+                        training_balance=self.training_balance(),
                         active_leases=[dict(block=v['block'], worker=v['worker'], age_s=round(time.time() - v['t0']))
                                        for v in self.leases.values()],
                         workers={k: {f: v for f, v in w.items() if f not in ('host', 'ip')} for k, w in m['workers'].items()}, last_eval=(m['evals'][-1] if m['evals'] else None),
@@ -2017,6 +2087,31 @@ class Coordinator:
                                   error=self.data.err),
                         lease_defaults=dict(steps=self.steps, batch=self.batch, lr=self.lr, max_steps=self.max_steps,
                                             max_batch=self.max_batch, ttl_s=self.ttl))
+
+
+def owner_inference_session(cookie):
+    """Validate the existing Linger session only; never grant access by caller IP."""
+    if not cookie or len(cookie) > 8192 or '\r' in cookie or '\n' in cookie:
+        return False
+    from http.cookies import SimpleCookie
+    try:
+        parsed = SimpleCookie()
+        parsed.load(cookie)
+        if not parsed.get('linger') or not parsed['linger'].value:
+            return False
+        owner_cookie = parsed['linger'].OutputString()
+    except Exception:
+        return False
+    conn = httpc.HTTPConnection('127.0.0.1', 8795, timeout=2)
+    try:
+        conn.request('GET', '/check', headers={'Cookie': owner_cookie,
+                     'X-Owner-Access': '0', 'X-Real-IP': '192.0.2.1', 'Host': '127.0.0.1'})
+        response = conn.getresponse()
+        return response.status == 200
+    except (OSError, httpc.HTTPException):
+        return False
+    finally:
+        conn.close()
 
 
 def serve(a):
@@ -2076,13 +2171,13 @@ def serve(a):
                 raise ValueError('bad payload')
             return msg
 
-        def _net_sample(self, q):
+        def _net_sample(self, q, owner=False):
             prompt = q.get('prompt', 'The ')[:200]
             sampler = q.get('sampler') or q.get('mode') or 'chain'
             if sampler not in ('chain', 'top'):
                 return self._send(400, dict(error='sampler must be chain or top'))
             try:
-                n, temp, seed = max(1, min(160, int(q.get('n', 64)))), float(q.get('temp', 0.0 if sampler == 'chain' else 0.75)), int(q.get('seed', 0)) % (2 ** 31)
+                n, temp, seed = max(1, min(2048 if owner else 160, int(q.get('n', 64)))), float(q.get('temp', 0.0 if sampler == 'chain' else 0.75)), int(q.get('seed', 0)) % (2 ** 31)
                 snapshot_id = int(q['snapshot']) if 'snapshot' in q else None
             except (ValueError, TypeError, OverflowError):
                 return self._send(400, dict(error='invalid generation parameters or snapshot'))
@@ -2096,7 +2191,7 @@ def serve(a):
             g = None
             headers_started = False
             try:
-                g = C.net.generate(prompt, n, temp=temp, seed=seed, sampler=sampler, route=route, snapshot_id=snapshot_id)
+                g = C.net.generate(prompt, n, temp=temp, seed=seed, sampler=sampler, route=route, snapshot_id=snapshot_id, budget_s=120 if owner else None)
                 first = next(g)  # Validate and pin before HTTP success.
                 self.close_connection = True
                 self.send_response(200)
@@ -2135,6 +2230,12 @@ def serve(a):
                     return self._send(200, C.public_status())
                 if p == 'code':
                     return self._send(200, src, 'text/x-python; charset=utf-8')
+                if p in ('owner-inference', 'owner-sample'):
+                    if self._client() != os.environ.get('DBMOE_OWNER_IP', '') or not owner_inference_session(self.headers.get('Cookie', '')):
+                        return self._send(403, dict(error='existing owner sign-in required'))
+                    if p == 'owner-inference':
+                        return self._send(200, dict(owner=True, max_bytes=2048, budget_s=120, context_bytes=C.net.ctx_len))
+                    return self._net_sample(q, owner=True)
                 if p == 'sample':
                     if q.get('net'):
                         return self._net_sample(q)

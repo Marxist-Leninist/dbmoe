@@ -452,6 +452,100 @@ def from_bytes(b):
     return torch.load(io.BytesIO(b), map_location='cpu', weights_only=True)
 
 
+def load_update_pickle(body, max_bytes, max_entries=4096):
+    """Load only bounded, uncompressed torch.save ZIPs from untrusted updates.
+
+    Parse the central directory ourselves before torch.load: ZipFile eagerly allocates one
+    ZipInfo per entry, and legacy pickle storage declarations can allocate beyond the input
+    length. The directory, records, declared storage and entry count are all bounded first.
+    Trusted coordinator leases still use from_bytes(), not this untrusted-update gate.
+    """
+    if len(body) > max_bytes:
+        raise ValueError('update body exceeds its byte budget')
+    if body[:4] != b'PK\x03\x04':
+        raise ValueError('update requires a torch.save ZIP archive')
+    eocd = body.rfind(b'PK\x05\x06', max(0, len(body) - (22 + 65535)))
+    if eocd < 0 or eocd + 22 > len(body):
+        raise ValueError('update archive has no valid end record')
+    try:
+        _, disk, cd_disk, n_disk, n_total, cd_size, cd_off, comment_len = \
+            struct.unpack_from('<4s4H2LH', body, eocd)
+    except struct.error as e:
+        raise ValueError('update archive has a truncated end record') from e
+    if eocd + 22 + comment_len != len(body):
+        raise ValueError('update archive has trailing or inconsistent data')
+    if (disk or cd_disk or n_disk != n_total or not n_total or n_total == 0xffff or
+            cd_size == 0xffffffff or cd_off == 0xffffffff):
+        raise ValueError('multi-disk and ZIP64 update archives are unsupported')
+    if n_total > max_entries:
+        raise ValueError(f'update archive has too many entries ({n_total} > {max_entries})')
+    if cd_size > (4 << 20):
+        raise ValueError('update archive directory exceeds its bounded budget')
+    cd_end = cd_off + cd_size
+    if cd_off > eocd or cd_end > eocd:
+        raise ValueError('update archive has an inconsistent central directory')
+    if cd_end != eocd:
+        # PyTorch writes a 56-byte ZIP64 end record plus its 20-byte locator even
+        # for small ordinary updates. Permit exactly that trailer, nothing else.
+        if (eocd - cd_end != 76 or body[cd_end:cd_end + 4] != b'PK' or
+                body[cd_end + 56:cd_end + 60] != b'PK' or
+                struct.unpack_from('<Q', body, cd_end + 4)[0] != 44):
+            raise ValueError('update archive has an inconsistent central directory')
+
+    entries = []
+    total = 0
+    pos = cd_off
+    end = cd_off + cd_size
+    for _ in range(n_total):
+        if pos + 46 > end or body[pos:pos + 4] != b'PK\x01\x02':
+            raise ValueError('update archive has a truncated central directory')
+        fields = struct.unpack_from('<4s6H3L5H2L', body, pos)
+        flags, method = fields[3], fields[4]
+        compressed, uncompressed = fields[8], fields[9]
+        name_len, extra_len, entry_comment_len = fields[10:13]
+        disk_start, local_off = fields[13], fields[16]
+        next_pos = pos + 46 + name_len + extra_len + entry_comment_len
+        if next_pos > end:
+            raise ValueError('update archive has a truncated directory entry')
+        if (flags & 1) or method != 0 or compressed != uncompressed:
+            raise ValueError('compressed or encrypted update archives are unsupported')
+        if (compressed == 0xffffffff or uncompressed == 0xffffffff or
+                local_off == 0xffffffff or disk_start == 0xffff):
+            raise ValueError('ZIP64 update records are unsupported')
+        if local_off + 30 > cd_off or body[local_off:local_off + 4] != b'PK\x03\x04':
+            raise ValueError('update archive has an invalid local record')
+        try:
+            name = body[pos + 46:pos + 46 + name_len].decode('ascii')
+        except UnicodeDecodeError as e:
+            raise ValueError('update archive has a non-ASCII record name') from e
+        entries.append((name, uncompressed))
+        total += uncompressed
+        if total > min(max_bytes, len(body)):
+            raise ValueError('update archive exceeds its bounded storage budget')
+        pos = next_pos
+    if pos != end or len(entries) != n_total:
+        raise ValueError('update archive entry count does not match its directory')
+
+    names = [name for name, _ in entries]
+    if not names or len(set(names)) != len(names) or '/' not in names[0]:
+        raise ValueError('invalid or duplicate update records')
+    root = names[0].split('/', 1)[0] + '/'
+    allowed = {'data.pkl', 'byteorder', 'version', '.format_version',
+               '.storage_alignment', '.data/serialization_id'}
+    metadata_bytes = 0
+    for name, size in entries:
+        if not name.startswith(root):
+            raise ValueError('inconsistent update archive root')
+        short = name[len(root):]
+        if not re.fullmatch(r'data/[0-9]+', short):
+            if short not in allowed:
+                raise ValueError('unsupported update archive record')
+            metadata_bytes += size
+    if root + 'data.pkl' not in names or metadata_bytes > (1 << 20):
+        raise ValueError('update metadata exceeds its bounded budget or is missing')
+    return torch.load(io.BytesIO(body), map_location='cpu', weights_only=True)
+
+
 # Opt-in safetensors wire format, for workers without PyTorch (worker-rs).  A lease or an update is one safetensors file:
 # its tensors in the tensor section, every other field as JSON in one metadata entry.  No pickle and no numpy.
 ST_DTYPES = {'F64': torch.float64, 'F32': torch.float32, 'F16': torch.float16, 'BF16': torch.bfloat16, 'I64': torch.int64,
@@ -2353,7 +2447,7 @@ def serve(a):
                         return self._reject(400, 'incomplete body')
                     body.extend(chunk)
                 ctype = (self.headers.get('Content-Type') or '').split(';')[0].strip().lower()
-                up = update_from_safetensors(body) if ctype == ST_UPDATE_TYPE else from_bytes(body)
+                up = update_from_safetensors(body) if ctype == ST_UPDATE_TYPE else load_update_pickle(body, a.max_upload_mb << 20)
                 if not isinstance(up, dict):
                     return self._reject(400, 'bad payload')
                 name = up.get('name', 'worker')

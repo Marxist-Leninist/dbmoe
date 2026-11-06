@@ -452,6 +452,32 @@ def from_bytes(b):
     return torch.load(io.BytesIO(b), map_location='cpu', weights_only=True)
 
 
+def update_zip_preflight(b, max_entries):
+    """Bound ZIP directory work before ZipFile allocates a ZipInfo for every entry.  _EndRecData reads only the
+    EOCD/ZIP64 records; the central-directory walk also catches an archive whose EOCD understates its entry count."""
+    endrec = zipfile._EndRecData(io.BytesIO(b))
+    if not endrec:
+        raise ValueError('invalid update ZIP directory')
+    declared = endrec[zipfile._ECD_ENTRIES_TOTAL]
+    if declared > max_entries:
+        raise ValueError(f'update archive has too many entries ({declared} > {max_entries})')
+    size_cd = endrec[zipfile._ECD_SIZE]
+    pos, end = endrec[zipfile._ECD_LOCATION] - size_cd, endrec[zipfile._ECD_LOCATION]
+    if pos < 0 or end > len(b):
+        raise ValueError('invalid update ZIP directory bounds')
+    count = 0
+    while pos < end:
+        if count >= max_entries:
+            raise ValueError(f'update archive has too many entries (over {max_entries})')
+        if pos + 46 > end or b[pos:pos + 4] != b'PK\x01\x02':
+            raise ValueError('invalid update ZIP central directory')
+        fields = struct.unpack_from('<4s6H3L5H2L', b, pos)
+        pos += 46 + fields[10] + fields[11] + fields[12]       # filename, extra field, comment
+        if pos > end:
+            raise ValueError('truncated update ZIP central directory')
+        count += 1
+
+
 def load_update_pickle(b, max_bytes, max_entries=4096):
     """from_bytes for the UNTRUSTED POST /update pickle path.  torch.save writes a ZIP whose entries are STORED
     (uncompressed), so a genuine update's uncompressed size ~ its wire size.  A hostile worker could instead send a
@@ -461,6 +487,7 @@ def load_update_pickle(b, max_bytes, max_entries=4096):
     always pass.  A non-ZIP body can't inflate past its own length, so it skips the check.  The safetensors update
     path (st_loads) is bounded separately."""
     if b[:4] == b'PK\x03\x04':
+        update_zip_preflight(b, max_entries)
         with zipfile.ZipFile(io.BytesIO(b)) as zf:
             infos = zf.infolist()
             if len(infos) > max_entries:

@@ -3,7 +3,9 @@ torch.load allocates anything.  A genuine torch.save update is a STORED (uncompr
 size is about its wire size and it passes; a DEFLATE-compressed ZIP that is tiny on the wire but inflates past the
 cap is refused.  See load_update_pickle in dbmoe.py."""
 import io
+import struct
 import unittest
+import unittest.mock
 import zipfile
 
 import torch
@@ -40,14 +42,21 @@ class UpdateZipGuardTest(unittest.TestCase):
             dbmoe.load_update_pickle(body, self.CAP)
         self.assertIn('inflates', str(cm.exception))
 
-    def test_many_entries_rejected(self):
+    def test_many_entries_rejected_before_zipfile(self):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_STORED) as zf:
             for i in range(20):
                 zf.writestr(f'archive/data/{i}', b'x')
-        with self.assertRaises(ValueError) as cm:
-            dbmoe.load_update_pickle(buf.getvalue(), self.CAP, max_entries=8)
+        body = bytearray(buf.getvalue())
+        eocd = body.rfind(b'PK\x05\x06')
+        struct.pack_into('<H', body, eocd + 8, 1)             # lie in both EOCD count fields: only the bounded
+        struct.pack_into('<H', body, eocd + 10, 1)            # central-directory walk can catch the 20 entries
+        with unittest.mock.patch.object(dbmoe.zipfile, 'ZipFile',
+                                        side_effect=AssertionError('ZipFile must not materialize excess entries')) as zf:
+            with self.assertRaises(ValueError) as cm:
+                dbmoe.load_update_pickle(body, self.CAP, max_entries=8)
         self.assertIn('too many entries', str(cm.exception))
+        zf.assert_not_called()
 
     def test_non_zip_body_skips_zip_check(self):
         # A non-ZIP body cannot inflate past its own length, so the zip guard is skipped and torch.load runs

@@ -1,12 +1,9 @@
-"""The POST /update pickle path must reject a decompression bomb by its declared uncompressed size before
-torch.load allocates anything.  A genuine torch.save update is a STORED (uncompressed) ZIP, so its uncompressed
-size is about its wire size and it passes; a DEFLATE-compressed ZIP that is tiny on the wire but inflates past the
-cap is refused.  See load_update_pickle in dbmoe.py."""
+"""Bounded validation for untrusted POST /update pickle uploads."""
 import io
 import struct
 import unittest
-import unittest.mock
 import zipfile
+from unittest.mock import patch
 
 import torch
 
@@ -14,60 +11,112 @@ import dbmoe
 
 
 class UpdateZipGuardTest(unittest.TestCase):
-    CAP = 1 << 20                                           # 1 MiB test cap (production uses --max-upload-mb << 20)
+    CAP = 1 << 20
+
+    @staticmethod
+    def archive(entries, compression=zipfile.ZIP_STORED):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w', compression) as zf:
+            for name, data in entries:
+                zf.writestr(name, data)
+        return buf.getvalue()
+
+    def reject_before_load(self, body, **kwargs):
+        cap = kwargs.pop('max_bytes', self.CAP)
+        with patch.object(dbmoe.torch, 'load') as load:
+            with self.assertRaises(ValueError):
+                dbmoe.load_update_pickle(body, cap, **kwargs)
+            load.assert_not_called()
 
     def test_genuine_update_round_trips(self):
-        # A realistic update payload: a handful of delta tensors plus scalar metadata, as a worker would send.
         up = dict(lease='L1', block=2, name='w', seconds=1.0,
                   d_block={'out.weight': torch.zeros(256, 256), 'ln.weight': torch.ones(256)},
                   d_shared={'emb.weight': torch.zeros(256, 256)})
         body = dbmoe.to_bytes(up)
-        self.assertEqual(body[:4], b'PK\x03\x04')           # torch.save writes a ZIP
-        self.assertLess(len(body), self.CAP)                # and it is comfortably under the cap on the wire
+        self.assertLess(len(body), self.CAP)
         out = dbmoe.load_update_pickle(body, self.CAP)
         self.assertEqual(out['lease'], 'L1')
         self.assertEqual(out['block'], 2)
-        self.assertTrue(torch.equal(out['d_block']['ln.weight'], torch.ones(256)))
+        self.assertTrue(torch.equal(out['d_block']['ln.weight'], up['d_block']['ln.weight']))
 
-    def test_deflate_bomb_rejected_by_declared_size(self):
-        # 4 MiB of zeros, DEFLATE-compressed: a few KB on the wire, but it declares 4 MiB uncompressed.
+    def test_legacy_allocation_bypass_rejected(self):
         buf = io.BytesIO()
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr('archive/data/0', b'\x00' * (4 << 20))
-        body = buf.getvalue()
-        self.assertEqual(body[:4], b'PK\x03\x04')
-        # The point of the bug: the body itself is tiny, so the wire-size cap alone never catches it.
+        torch.save(torch.zeros(1 << 20), buf, _use_new_zipfile_serialization=False)
+        self.reject_before_load(buf.getvalue()[:512])
+
+    def test_valid_legacy_pickle_rejected(self):
+        buf = io.BytesIO()
+        torch.save({'x': torch.ones(1)}, buf, _use_new_zipfile_serialization=False)
+        self.reject_before_load(buf.getvalue())
+
+    def test_non_zip_rejected(self):
+        self.reject_before_load(b'not-a-zip-body')
+
+    def test_deflate_bomb_rejected(self):
+        body = self.archive([('archive/data.pkl', b'x'),
+                             ('archive/data/0', bytes(4 << 20))], zipfile.ZIP_DEFLATED)
         self.assertLess(len(body), self.CAP)
-        with self.assertRaises(ValueError) as cm:
-            dbmoe.load_update_pickle(body, self.CAP)
-        self.assertIn('inflates', str(cm.exception))
+        self.reject_before_load(body)
 
-    def test_many_entries_rejected_before_zipfile(self):
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_STORED) as zf:
-            for i in range(20):
-                zf.writestr(f'archive/data/{i}', b'x')
-        body = bytearray(buf.getvalue())
+    def test_small_compressed_archive_rejected(self):
+        self.reject_before_load(self.archive([('archive/data.pkl', b'x')], zipfile.ZIP_DEFLATED))
+
+    def test_many_entries_rejected(self):
+        body = self.archive([('archive/data.pkl', b'x')] +
+                            [('archive/data/' + str(i), b'x') for i in range(10)])
+        self.reject_before_load(body, max_entries=8)
+
+    def test_forged_eocd_count_cannot_hide_directory_entries(self):
+        body = bytearray(self.archive([('archive/data.pkl', b'x')] +
+                                      [('archive/data/' + str(i), b'x') for i in range(4)]))
         eocd = body.rfind(b'PK\x05\x06')
-        struct.pack_into('<H', body, eocd + 8, 1)             # lie in both EOCD count fields: only the bounded
-        struct.pack_into('<H', body, eocd + 10, 1)            # central-directory walk can catch the 20 entries
-        with unittest.mock.patch.object(dbmoe.zipfile, 'ZipFile',
-                                        side_effect=AssertionError('ZipFile must not materialize excess entries')) as zf:
-            with self.assertRaises(ValueError) as cm:
-                dbmoe.load_update_pickle(body, self.CAP, max_entries=8)
-        self.assertIn('too many entries', str(cm.exception))
-        zf.assert_not_called()
+        struct.pack_into('<H', body, eocd + 8, 1)
+        struct.pack_into('<H', body, eocd + 10, 1)
+        self.reject_before_load(bytes(body))
 
-    def test_non_zip_body_skips_zip_check(self):
-        # A non-ZIP body cannot inflate past its own length, so the zip guard is skipped and torch.load runs
-        # (and rejects this garbage itself). The guard must NOT raise its own 'inflates'/'entries' error here.
-        try:
-            dbmoe.load_update_pickle(b'not-a-zip-body', self.CAP)
-        except ValueError as e:
-            self.assertNotIn('inflates', str(e))
-            self.assertNotIn('too many entries', str(e))
-        except Exception:
-            pass                                            # torch.load raising on non-pickle input is fine
+    def test_zip64_end_record_rejected(self):
+        body = bytearray(self.archive([('archive/data.pkl', b'x')]))
+        eocd = body.rfind(b'PK\x05\x06')
+        struct.pack_into('<H', body, eocd + 8, 0xffff)
+        struct.pack_into('<H', body, eocd + 10, 0xffff)
+        self.reject_before_load(bytes(body))
+
+    def test_duplicate_rejected(self):
+        self.reject_before_load(self.archive([('archive/data.pkl', b'x')] * 2))
+
+    def test_unknown_record_rejected(self):
+        self.reject_before_load(self.archive([('archive/data.pkl', b'x'), ('archive/code.py', b'x')]))
+
+    def test_mixed_root_rejected(self):
+        self.reject_before_load(self.archive([('archive/data.pkl', b'x'), ('other/data/0', b'x')]))
+
+    def test_missing_metadata_rejected(self):
+        self.reject_before_load(self.archive([('archive/data/0', b'x')]))
+
+    def test_aggregate_metadata_rejected(self):
+        body = self.archive([('archive/data.pkl', bytes(600000)), ('archive/byteorder', bytes(600000))])
+        self.reject_before_load(body)
+
+    def test_wire_cap_enforced(self):
+        body = dbmoe.to_bytes({'x': torch.ones(16)})
+        self.reject_before_load(body, max_bytes=len(body) - 1)
+
+    def test_malformed_zip_rejected(self):
+        self.reject_before_load(b'PK\x03\x04' + bytes(30))
+
+    def test_trailing_data_rejected(self):
+        self.reject_before_load(self.archive([('archive/data.pkl', b'x')]) + b'extra')
+
+    def test_untrusted_handler_uses_guard(self):
+        import inspect
+        source = inspect.getsource(dbmoe.serve)
+        self.assertIn('load_update_pickle(body, a.max_upload_mb << 20)', source)
+        self.assertIn('update_from_safetensors(body)', source)
+
+    def test_trusted_loader_unchanged(self):
+        buf = io.BytesIO()
+        torch.save({'x': torch.ones(1)}, buf, _use_new_zipfile_serialization=False)
+        self.assertTrue(torch.equal(dbmoe.from_bytes(buf.getvalue())['x'], torch.ones(1)))
 
 
 if __name__ == '__main__':

@@ -550,6 +550,14 @@ def lease_to_safetensors(L):
     return st_dumps(tensors, {'dbmoe.lease': json.dumps(meta, allow_nan=False)})
 
 
+def update_to_safetensors(up):
+    """Encode worker deltas without pickle; other fields remain JSON metadata."""
+    tensors = {f'd_shared.{k}': v for k, v in up['d_shared'].items()}
+    tensors.update({f'd_block.{k}': v for k, v in up['d_block'].items()})
+    meta = {k: v for k, v in up.items() if k not in ('d_shared', 'd_block')}
+    return st_dumps(tensors, {'dbmoe.update': json.dumps(meta, allow_nan=False)})
+
+
 def update_from_safetensors(body):
     """The update dict from a safetensors upload: d_shared.* and d_block.* tensors plus the fields in 'dbmoe.update'.
     It then goes through exactly the checks a torch.save upload does."""
@@ -2388,9 +2396,9 @@ def serve(a):
 
 
 # ------------------------------------------------------------------------------------------------------------- worker
-def http(method, url, token, body=None, timeout=900):
+def http(method, url, token, body=None, timeout=900, content_type='application/octet-stream'):
     req = urllib.request.Request(url, data=body, method=method, headers={'Authorization': f'Bearer {token}',
-                                                                          'Content-Type': 'application/octet-stream',
+                                                                          'Content-Type': content_type,
                                                                           'User-Agent': VERSION})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
@@ -2924,7 +2932,7 @@ def post_update(base, token, body, tries=4):
     lease merges at most once, so a retry after a lost reply gets a clean refusal rather than merging twice."""
     for attempt in range(tries):
         try:
-            return json.loads(http('POST', f'{base}/update', token, body))
+            return json.loads(http('POST', f'{base}/update', token, body, content_type=ST_UPDATE_TYPE))
         except urllib.error.HTTPError as e:
             if e.code not in (429, 502, 503, 504) or attempt == tries - 1:
                 raise
@@ -3033,7 +3041,7 @@ def worker(a):
             up.update(name=a.name, device=device_info['device'])
             if hardware:
                 up['hardware'] = hardware
-            body = to_bytes(up)
+            body = update_to_safetensors(up)
             t2 = time.time()
             r = post_update(base, a.token, body)
             tail = up['losses'][-5:]

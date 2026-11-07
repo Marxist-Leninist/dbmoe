@@ -17,10 +17,11 @@ class AllocatorTests(unittest.TestCase):
         a._trim=fail;self.assertFalse(a.maybe_trim());self.assertIsNone(a._trim)
         self.assertTrue(a._lock.acquire(False));a._lock.release()
     def test_busy_is_nonblocking(self):
-        a=m.WorkerAllocatorMaintenance();a._trim=lambda n:self.fail('busy trim')
+        calls=[];a=m.WorkerAllocatorMaintenance();a._trim=lambda n:calls.append(n)
         a._lock.acquire()
         try:self.assertFalse(a.maybe_trim())
         finally:a._lock.release()
+        self.assertEqual(calls,[])
     def test_nonlinux_is_noop(self):
         with patch.object(m.sys,'platform','darwin'):
             a=m.WorkerAllocatorMaintenance()

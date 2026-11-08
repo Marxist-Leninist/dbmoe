@@ -1407,6 +1407,7 @@ class NetInfer:
     def hop(self, job):
         """One block's part of one byte, on a worker if at all possible.  Returns z, logits-or-None, and what ran it."""
         tried = set()
+        verification_failed = False
         for _ in range(0 if job.get('route') == 'single' else self.retries + 1):
             P, p = self._claim(job, tried)
             if P is None:
@@ -1443,7 +1444,12 @@ class NetInfer:
                 if ok is False:
                     self._strike(key, p)
                     if job.get('route') == 'distributed':
-                        raise RuntimeError('distributed verification failed; no single-host substitution')
+                        # Discard the bad result, but allow another worker of this exact
+                        # snapshot/block to finish the hop within the existing budget.
+                        verification_failed = True
+                        with self.cv:
+                            self.stats['retries'] += 1
+                        continue
                     with self.cv:
                         self.stats['hops_coordinator'] += 1
                     return zc, lc, dict(block=job['block'], via='coordinator', ms=round(ms))
@@ -1453,6 +1459,8 @@ class NetInfer:
                 self.stats['hops_network'] += 1
             return zl, lg, dict(block=job['block'], via=self.C.alias(p['worker']), ms=round(ms))
         if job.get('route') == 'distributed':
+            if verification_failed:
+                raise RuntimeError('distributed verification failed; no single-host substitution')
             raise RuntimeError('distributed route unavailable; no single-host substitution')
         t0 = time.time()
         with self.cv:
@@ -3031,6 +3039,28 @@ class Keep:
                     raise
 
 
+def load_inference_block(payload, assignment):
+    """Validate the pinned placement before replacing a worker's current block.
+
+    This checks assignment consistency, not authenticity: transport security and
+    coordinator result audits remain necessary for untrusted participants.
+    """
+    if not isinstance(payload, dict) or not isinstance(assignment, dict):
+        raise ValueError('invalid inference assignment or payload')
+    for key in ('snap', 'block'):
+        if (type(assignment.get(key)) is not int or type(payload.get(key)) is not int
+                or payload[key] != assignment[key]):
+            raise ValueError('inference payload does not match assigned snapshot and block')
+    cfg = payload['cfg']
+    if (not isinstance(cfg, dict) or type(cfg.get('blocks')) is not int
+            or not 0 <= payload['block'] < cfg['blocks']):
+        raise ValueError('inference block outside model configuration')
+    sh, bl = Shared(cfg), Block(cfg)
+    sh.load_state_dict(payload['shared'])
+    bl.load_state_dict(payload['block_state'])
+    return dict(snap=payload['snap'], block=payload['block'], shared=sh.eval(), module=bl.eval(), d=cfg['d'])
+
+
 def serve_job(held, job):
     t0 = time.time()
     try:
@@ -3059,10 +3089,7 @@ def serve_hops(a, base):
             if r.get('assign'):
                 asg = r['assign']
                 L = from_bytes(http('GET', f"{base}/iblock?snap={int(asg['snap'])}&block={int(asg['block'])}", a.token, timeout=300))
-                sh, bl = Shared(L['cfg']), Block(L['cfg'])
-                sh.load_state_dict(L['shared'])
-                bl.load_state_dict(L['block_state'])
-                held = dict(snap=L['snap'], block=L['block'], shared=sh.eval(), module=bl.eval(), d=L['cfg']['d'])
+                held = load_inference_block(L, asg)
                 print(f"[serve] holding block {held['block']} of snapshot {held['snap']}", flush=True)
             elif r.get('job'):
                 result = serve_job(held, r['job']) if held else dict(id=r['job'].get('id'), error='no block held')

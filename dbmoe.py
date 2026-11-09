@@ -3179,6 +3179,40 @@ def train_lease(L, device, opt_cache=None):
                 d_block={k: (v.detach().float().cpu() - b0[k].float().cpu()) for k, v in block.state_dict().items()})
 
 
+class WorkerAllocatorMaintenance:
+    """Best-effort release of unused Linux CPU heap pages after accepted work."""
+    def __init__(self, interval=60.0, clock=time.monotonic):
+        self.interval, self.clock = interval, clock
+        self._last = float('-inf')
+        self._lock = threading.Lock()
+        self._trim = None
+        if sys.platform.startswith('linux'):
+            try:
+                import ctypes
+                trim = ctypes.CDLL(None).malloc_trim
+                trim.argtypes = [ctypes.c_size_t]
+                trim.restype = ctypes.c_int
+                self._trim = trim
+            except (AttributeError, OSError):
+                pass
+
+    def maybe_trim(self):
+        if self._trim is None or not self._lock.acquire(blocking=False):
+            return False
+        try:
+            now = self.clock()
+            if now - self._last < self.interval:
+                return False
+            self._last = now
+            self._trim(0)
+            return True
+        except Exception:
+            self._trim = None
+            return False
+        finally:
+            self._lock.release()
+
+
 def worker(a):
     torch.set_num_threads(max(1, a.threads))
     try:
@@ -3214,6 +3248,7 @@ def worker(a):
         return serve_hops(a, base)
     if not getattr(a, 'no_serve', True):
         threading.Thread(target=serve_hops, args=(a, base), daemon=True).start()
+    memory_maintenance = WorkerAllocatorMaintenance() if str(device) == "cpu" else None
     backoff, done, opt_cache = 5, 0, {}
     t_end = time.time() + a.hours * 3600 if a.hours else None
     q = urllib.parse.urlencode(dict(name=a.name, steps=a.steps or '', batch=a.batch or '', session=secrets.token_hex(6)))
@@ -3233,6 +3268,9 @@ def worker(a):
             print(f"[worker] block {L['block']}{' (fresh Adam)' if up['fresh_optimizer'] else ''}  ce {up['losses'][0]:.3f} -> {sum(tail) / len(tail):.3f}  "
                   f"{up['tokens'] / max(up['seconds'], 1e-6):.0f} bytes/s  train {up['seconds']:.0f}s  "
                   f"net {t1 - t0 + time.time() - t2:.1f}s  -> {r}", flush=True)
+            del L, up, body  # Uploaded successfully; keep only bounded optimizer state.
+            if memory_maintenance is not None:
+                memory_maintenance.maybe_trim()
             backoff, done = 5, done + 1
             if a.once and done >= a.once:
                 return

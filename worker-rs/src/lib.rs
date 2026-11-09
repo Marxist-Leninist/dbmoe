@@ -40,8 +40,9 @@ pub fn block_on<F: core::future::Future>(f: F) -> F::Output {
 ///
 /// `cpu` (or `flex`) is Burn's pure-Rust CPU backend, always available. `gpu` (or `wgpu`) is the best GPU that
 /// wgpu finds (DirectX 12 on Windows, Vulkan on Linux, Metal on macOS, WebGPU in a browser), `igpu`/`dgpu` an
-/// integrated/discrete one, `auto` CubeCL's own pick. `dx12`, `vulkan`, `metal`, `opengl`, `webgpu`, `cuda` and
-/// `rocm` pin one API. GPU names need the matching cargo feature.
+/// integrated/discrete one, and `adreno` an integrated Qualcomm GPU (DirectX 12 on Windows ARM64, Vulkan on
+/// supported Linux drivers). `auto` is CubeCL's own pick. `dx12`, `vulkan`, `metal`, `opengl`, `webgpu`, `cuda`
+/// and `rocm` pin one API. GPU names need the matching cargo feature.
 pub fn device_from_name(name: &str) -> Result<Device, String> {
     let n = name.trim().to_ascii_lowercase();
     match n.as_str() {
@@ -51,7 +52,7 @@ pub fn device_from_name(name: &str) -> Result<Device, String> {
         #[cfg(feature = "wgpu")]
         "dgpu" | "discrete" => gpu(burn::tensor::DeviceKind::DiscreteGpu(0)),
         #[cfg(feature = "wgpu")]
-        "igpu" | "integrated" => gpu(burn::tensor::DeviceKind::IntegratedGpu(0)),
+        "igpu" | "integrated" | "adreno" => gpu(burn::tensor::DeviceKind::IntegratedGpu(0)),
         #[cfg(feature = "wgpu")]
         "auto" => Ok(Device::wgpu(burn::tensor::DeviceKind::DefaultDevice)),
         #[cfg(feature = "vulkan")]
@@ -106,7 +107,7 @@ fn pinned(api: burn::tensor::wgpu::WgpuBackend) -> Result<Device, String> {
 pub fn known_devices() -> Vec<&'static str> {
     let mut v = vec!["cpu"];
     if cfg!(feature = "wgpu") {
-        v.extend(["gpu", "dgpu", "igpu", "auto"]);
+        v.extend(["gpu", "dgpu", "igpu", "adreno", "auto"]);
         if cfg!(not(target_family = "wasm")) {
             v.extend(["dx12", "vulkan", "metal", "opengl"]);
         }

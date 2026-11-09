@@ -2,7 +2,7 @@ name: worker-rs
 
 # The Rust worker: unit and parity tests on Linux, Windows and Apple Silicon; parity against fixtures regenerated
 # from the current dbmoe.py; an end-to-end run against a local coordinator; release binaries (a static Linux one,
-# Windows with a static C runtime, macOS arm64) and the browser (wasm32 + WebGPU) build.
+# Windows x86_64 and ARM64 with a static C runtime, macOS arm64) and the browser (wasm32 + WebGPU) build.
 on:
   push:
     branches: [main]
@@ -96,6 +96,11 @@ jobs:
             target: x86_64-pc-windows-msvc
             features: wgpu
             rustflags: -C target-feature=+crt-static
+          - name: windows-arm64-adreno
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            features: wgpu
+            rustflags: -C target-feature=+crt-static
           - name: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
@@ -127,6 +132,7 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then exe="$exe.exe"; fi
           "$exe" version
           "$exe" devices
+          if [ "${{ matrix.name }}" = "windows-arm64-adreno" ]; then "$exe" devices | grep -Fx adreno; fi
           "$exe" parity --fixture apple/parity.json
           if [ "$RUNNER_OS" = "Linux" ]; then file "$exe"; ldd "$exe" || true; fi
           if [ "$RUNNER_OS" = "macOS" ]; then otool -L "$exe"; fi

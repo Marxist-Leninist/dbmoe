@@ -24,8 +24,8 @@ parity   Repeat the reference training step in apple/parity.json and compare eve
 bench    Time training steps of the live model configuration on random bytes.
 
 --device  cpu (default) is Burn's pure-Rust CPU backend. gpu picks the best GPU through wgpu (DirectX 12 on
-          Windows, Vulkan on Linux, Metal on macOS); igpu/dgpu ask for an integrated/discrete one; dx12, vulkan,
-          metal and opengl pin a graphics API. Needs a build with --features wgpu.
+          Windows, Vulkan on Linux, Metal on macOS); igpu/dgpu ask for an integrated/discrete one; adreno selects
+          an integrated Qualcomm GPU; dx12, vulkan, metal and opengl pin a graphics API. Needs --features wgpu.
 --threads CPU threads (default 2 for worker, all cores for bench).";
 
 struct Opts {
